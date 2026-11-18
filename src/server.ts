@@ -1,0 +1,631 @@
+import http from "node:http"
+import type { IncomingMessage, ServerResponse } from "node:http"
+import { createReadStream } from "node:fs"
+import { mkdir, open as openFd, readFile, rename, stat, writeFile } from "node:fs/promises"
+import { extname, join, resolve } from "node:path"
+import { randomBytes, randomUUID } from "node:crypto"
+import { openDb } from "./db.ts"
+import { MIME, blobPath, ensureParent, fileExists, hashFile, removeQuiet } from "./storage.ts"
+
+const ROOT = resolve(import.meta.dirname, "..")
+const WEB = join(ROOT, "web")
+const DATA = process.env.DATA_DIR ? resolve(process.env.DATA_DIR) : join(ROOT, "data")
+const BLOBS = join(DATA, "blobs")
+const TMP = join(DATA, "tmp")
+const PORT = Number(process.env.PORT ?? 8787)
+const HOST = process.env.HOST ?? "127.0.0.1"
+const CHUNK = 4 * 1024 * 1024
+const INBOX = "inbox"
+const INBOX_TTL_H = Number(process.env.INBOX_TTL_H ?? 24)
+const INBOX_TTL = INBOX_TTL_H * 3600 * 1000
+const TOKEN = process.env.DS_TOKEN ?? ""
+const RAW_BASE = process.env.BASE_PATH ?? ""
+const BASE = RAW_BASE.endsWith("/") ? RAW_BASE.slice(0, RAW_BASE.length - 1) : RAW_BASE
+
+await mkdir(BLOBS, { recursive: true })
+await mkdir(TMP, { recursive: true })
+const db = openDb(join(DATA, "drive.db"))
+db.prepare("INSERT INTO nodes (id, parent_id, name, kind, blob_hash, size, mtime, deleted, created_at, expires_at) VALUES (?, NULL, ?, 'folder', NULL, 0, ?, 0, ?, NULL) ON CONFLICT(id) DO NOTHING").run(INBOX, "传输站", Date.now(), Date.now())
+
+type Upload = {
+  id: string
+  name: string
+  parentId: string | null
+  size: number
+  hash: string | null
+  path: string
+  received: number
+}
+
+const uploads = new Map<string, Upload>()
+const subs = new Set<ServerResponse>()
+
+function sendJson(res: ServerResponse, code: number, data: unknown): void {
+  const body = JSON.stringify(data)
+  res.writeHead(code, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": Buffer.byteLength(body),
+    "cache-control": "no-store",
+  })
+  res.end(body)
+}
+
+function fail(res: ServerResponse, code: number, message: string): void {
+  sendJson(res, code, { error: message })
+}
+
+function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const parts: Buffer[] = []
+    let total = 0
+    req.on("data", (chunk: Buffer) => {
+      total += chunk.length
+      if (total > limit) {
+        rejectPromise(new Error("body too large"))
+        req.destroy()
+        return
+      }
+      parts.push(chunk)
+    })
+    req.on("end", () => resolvePromise(Buffer.concat(parts)))
+    req.on("error", rejectPromise)
+  })
+}
+
+async function readJson(req: IncomingMessage): Promise<any> {
+  const buf = await readBody(req, 2 * 1024 * 1024)
+  if (buf.length === 0) return {}
+  try {
+    return JSON.parse(buf.toString("utf8"))
+  } catch {
+    throw new Error("invalid json")
+  }
+}
+
+function sanitizeName(raw: unknown): string {
+  const name = String(raw ?? "").replace(/[\\/:*?"<>|\x00-\x1f]/g, "_").trim()
+  return name.slice(0, 200) || "未命名"
+}
+
+function uniqueName(parentId: string | null, name: string): string {
+  const hit = db.prepare("SELECT 1 FROM nodes WHERE parent_id IS ? AND name = ? AND deleted = 0").get(parentId, name)
+  if (!hit) return name
+  const dot = name.lastIndexOf(".")
+  const base = dot > 0 ? name.slice(0, dot) : name
+  const ext = dot > 0 ? name.slice(dot) : ""
+  for (let i = 1; i < 999; i++) {
+    const cand = base + " (" + i + ")" + ext
+    const dup = db.prepare("SELECT 1 FROM nodes WHERE parent_id IS ? AND name = ? AND deleted = 0").get(parentId, cand)
+    if (!dup) return cand
+  }
+  return base + " (" + Date.now() + ")" + ext
+}
+
+function createNode(kind: string, name: string, parentId: string | null, size: number, hash: string | null, expiresAt: number | null = null): string {
+  const id = randomUUID()
+  const ts = Date.now()
+  db.prepare(
+    "INSERT INTO nodes (id, parent_id, name, kind, blob_hash, size, mtime, deleted, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)"
+  ).run(id, parentId, uniqueName(parentId, name), kind, hash, size, ts, ts, expiresAt)
+  return id
+}
+
+function createFileNode(name: string, parentId: string | null, size: number, hash: string, expiresAt: number | null = null): string {
+  const id = createNode("file", name, parentId, size, hash, expiresAt)
+  db.prepare("INSERT INTO blobs (hash, size, refs, created_at) VALUES (?, ?, 0, ?) ON CONFLICT(hash) DO NOTHING").run(hash, size, Date.now())
+  db.prepare("UPDATE blobs SET refs = refs + 1 WHERE hash = ?").run(hash)
+  return id
+}
+
+function deleteTree(id: string): void {
+  const self = db.prepare("SELECT kind FROM nodes WHERE id = ? AND deleted = 0").get(id) as any
+  if (self && self.kind === "file") releaseBlob(id)
+  const children = db.prepare("SELECT id, kind FROM nodes WHERE parent_id = ? AND deleted = 0").all(id) as any[]
+  for (const child of children) {
+    if (child.kind === "folder") deleteTree(child.id)
+    else releaseBlob(child.id)
+  }
+  db.prepare("UPDATE nodes SET deleted = 1 WHERE id = ?").run(id)
+}
+
+function releaseBlob(id: string): void {
+  const row = db.prepare("SELECT blob_hash FROM nodes WHERE id = ?").get(id) as any
+  if (row && row.blob_hash) {
+    db.prepare("UPDATE blobs SET refs = refs - 1 WHERE hash = ?").run(row.blob_hash)
+  }
+  db.prepare("DELETE FROM shares WHERE node_id = ?").run(id)
+}
+
+function subscribe(req: IncomingMessage, res: ServerResponse): void {
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+  })
+  res.write(": connected\n\n")
+  subs.add(res)
+  req.on("close", () => {
+    subs.delete(res)
+  })
+}
+
+function broadcast(event: string, data: unknown): void {
+  const payload = "event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n"
+  for (const client of subs) client.write(payload)
+}
+
+function contentDisposition(name: string): string {
+  const ascii = name.replace(/[^\x20-\x7e]/g, "_").replace(/"/g, "'")
+  return "attachment; filename=\"" + ascii + "\"; filename*=UTF-8''" + encodeURIComponent(name)
+}
+
+async function streamFile(req: IncomingMessage, res: ServerResponse, file: string, name: string): Promise<void> {
+  const info = await stat(file)
+  const type = MIME[extname(name).toLowerCase()] ?? "application/octet-stream"
+  const range = req.headers.range
+  const base = {
+    "content-type": type,
+    "accept-ranges": "bytes",
+    "content-disposition": contentDisposition(name),
+    "cache-control": "private, max-age=0",
+  }
+  if (range) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range)
+    if (match) {
+      const start = match[1] ? Number(match[1]) : 0
+      const end = match[2] ? Math.min(Number(match[2]), info.size - 1) : info.size - 1
+      if (start <= end && start < info.size) {
+        res.writeHead(206, { ...base, "content-range": "bytes " + start + "-" + end + "/" + info.size, "content-length": end - start + 1 })
+        createReadStream(file, { start, end }).pipe(res)
+        return
+      }
+    }
+    res.writeHead(416, { "content-range": "bytes */" + info.size })
+    res.end()
+    return
+  }
+  res.writeHead(200, { ...base, "content-length": info.size })
+  createReadStream(file).pipe(res)
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+}
+
+function humanSize(n: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"]
+  let v = n
+  let i = 0
+  while (v >= 1024 && i < units.length - 1) {
+    v = v / 1024
+    i++
+  }
+  return (i === 0 ? String(v) : v.toFixed(1)) + " " + units[i]
+}
+
+function sharePage(name: string, size: number, token: string, expiresAt: number | null): string {
+  const exp = expiresAt ? new Date(expiresAt).toLocaleString("zh-CN") : "永久有效"
+  const lines = [
+    "<!doctype html>",
+    "<meta charset=\"utf-8\">",
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+    "<title>" + escapeHtml(name) + " · DriveSend</title>",
+    "<style>",
+    "html,body{height:100%}",
+    "body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f5f7;color:#1d1d1f;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','PingFang SC','Microsoft YaHei',sans-serif;-webkit-font-smoothing:antialiased}",
+    "body::before{content:'';position:fixed;inset:-25vmax;z-index:-1;background:radial-gradient(38vmax 38vmax at 10% 8%,rgba(122,178,255,.55),transparent 62%),radial-gradient(32vmax 32vmax at 88% 2%,rgba(255,176,212,.5),transparent 60%),radial-gradient(40vmax 40vmax at 78% 88%,rgba(150,226,208,.5),transparent 62%);filter:blur(40px) saturate(120%)}",
+    ".card{width:min(520px,90vw);background:rgba(255,255,255,.72);-webkit-backdrop-filter:saturate(180%) blur(22px);backdrop-filter:saturate(180%) blur(22px);border:1px solid rgba(255,255,255,.9);border-radius:22px;padding:30px;box-shadow:0 18px 50px rgba(0,0,0,.1),0 1px 2px rgba(0,0,0,.04)}",
+    ".kicker{color:#86868b;font-size:11px;letter-spacing:.14em;text-transform:uppercase}",
+    "h1{font-size:21px;margin:10px 0 6px;word-break:break-all;letter-spacing:-.015em}",
+    ".meta{color:#6e6e73;font-size:13px;margin-bottom:22px}",
+    "a.btn{display:block;text-align:center;padding:13px;border-radius:980px;background:linear-gradient(180deg,#0a84ff,#0071e3);color:#fff;text-decoration:none;font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.12),inset 0 1px 0 rgba(255,255,255,.24)}",
+    "a.btn:hover{filter:brightness(1.06)}",
+    "</style>",
+    "<div class=\"card\">",
+    "<div class=\"kicker\">DriveSend 分享</div>",
+    "<h1>" + escapeHtml(name) + "</h1>",
+    "<div class=\"meta\">" + humanSize(size) + " · " + exp + "</div>",
+    "<a class=\"btn\" href=\"" + BASE + "/s/" + token + "/download\">下载</a>",
+    "</div>",
+  ]
+  return lines.join("\n")
+}
+
+async function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<void> {
+  const rel = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "")
+  const file = resolve(WEB, rel)
+  if (!file.startsWith(WEB)) {
+    fail(res, 403, "forbidden")
+    return
+  }
+  if (!(await fileExists(file))) {
+    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" })
+    res.end("404")
+    return
+  }
+  const type = MIME[extname(file).toLowerCase()] ?? "application/octet-stream"
+  const body = await readFile(file)
+  res.writeHead(200, { "content-type": type, "content-length": body.length, "cache-control": "no-cache" })
+  res.end(body)
+}
+
+function stats() {
+  const physical = (db.prepare("SELECT COALESCE(SUM(size),0) AS s FROM blobs WHERE refs > 0").get() as any).s as number
+  const logical = (db.prepare("SELECT COALESCE(SUM(size),0) AS s FROM nodes WHERE deleted = 0 AND kind = 'file'").get() as any).s as number
+  const files = (db.prepare("SELECT COUNT(*) AS c FROM nodes WHERE deleted = 0 AND kind = 'file'").get() as any).c as number
+  const blobs = (db.prepare("SELECT COUNT(*) AS c FROM blobs WHERE refs > 0").get() as any).c as number
+  return { physicalBytes: physical, logicalBytes: logical, files, blobs, savedBytes: Math.max(0, logical - physical) }
+}
+
+function inboxSummary() {
+  const row = db.prepare("SELECT COUNT(*) AS c, COALESCE(SUM(size),0) AS s FROM nodes WHERE parent_id = ? AND deleted = 0 AND kind = 'file'").get(INBOX) as any
+  return { count: row.c as number, bytes: row.s as number }
+}
+
+function loginPage(): string {
+  const lines = [
+    "<!doctype html>",
+    "<meta charset=\"utf-8\">",
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+    "<title>DriveSend · 登录</title>",
+    "<style>",
+    "html,body{height:100%}",
+    "body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f5f7;color:#1d1d1f;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','PingFang SC','Microsoft YaHei',sans-serif;-webkit-font-smoothing:antialiased}",
+    "body::before{content:'';position:fixed;inset:-25vmax;z-index:-1;background:radial-gradient(38vmax 38vmax at 10% 8%,rgba(122,178,255,.55),transparent 62%),radial-gradient(32vmax 32vmax at 88% 2%,rgba(255,176,212,.5),transparent 60%),radial-gradient(40vmax 40vmax at 78% 88%,rgba(150,226,208,.5),transparent 62%);filter:blur(40px) saturate(120%)}",
+    ".card{width:min(380px,90vw);background:rgba(255,255,255,.72);-webkit-backdrop-filter:saturate(180%) blur(22px);backdrop-filter:saturate(180%) blur(22px);border:1px solid rgba(255,255,255,.9);border-radius:22px;padding:28px;box-shadow:0 18px 50px rgba(0,0,0,.1)}",
+    "h1{font-size:19px;margin:0 0 6px;letter-spacing:-.015em}",
+    "p{color:#6e6e73;font-size:13px;margin:0 0 18px}",
+    "input{width:100%;padding:12px 14px;border-radius:12px;border:1px solid rgba(0,0,0,.1);background:rgba(255,255,255,.9);color:#1d1d1f;font-size:14px;outline:none}",
+    "input:focus{border-color:rgba(0,113,227,.6);box-shadow:0 0 0 4px rgba(0,113,227,.12)}",
+    "button{width:100%;margin-top:12px;padding:12px;border:0;border-radius:980px;background:linear-gradient(180deg,#0a84ff,#0071e3);color:#fff;font-weight:600;font-size:14px;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,.12),inset 0 1px 0 rgba(255,255,255,.24)}",
+    "</style>",
+    "<form class=\"card\" method=\"get\" action=\"" + BASE + "/\">",
+    "<h1>DriveSend</h1>",
+    "<p>这个实例需要访问令牌</p>",
+    "<input name=\"token\" type=\"password\" placeholder=\"访问令牌\" autofocus>",
+    "<button>进入</button>",
+    "</form>",
+  ]
+  return lines.join("\n")
+}
+
+function readCookie(req: IncomingMessage, key: string): string | null {
+  const raw = String(req.headers.cookie ?? "")
+  for (const part of raw.split(";")) {
+    const idx = part.indexOf("=")
+    if (idx < 0) continue
+    if (part.slice(0, idx).trim() === key) return part.slice(idx + 1).trim()
+  }
+  return null
+}
+
+function authed(req: IncomingMessage, url: URL): boolean {
+  if (!TOKEN) return true
+  if (String(req.headers.authorization ?? "") === "Bearer " + TOKEN) return true
+  if (readCookie(req, "ds_token") === TOKEN) return true
+  if (url.searchParams.get("token") === TOKEN) return true
+  return false
+}
+
+async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = new URL(req.url ?? "/", "http://localhost")
+  const path = url.pathname
+  const method = req.method ?? "GET"
+
+  if (TOKEN) {
+    const supplied = url.searchParams.get("token")
+    if (supplied) {
+      if (supplied !== TOKEN) {
+        if (path.startsWith("/api/")) return fail(res, 401, "unauthorized")
+        res.writeHead(401, { "content-type": "text/html; charset=utf-8" })
+        res.end(loginPage())
+        return
+      }
+      res.writeHead(302, {
+        "set-cookie": "ds_token=" + TOKEN + "; Path=" + (BASE === "" ? "/" : BASE + "/") + "; HttpOnly; SameSite=Lax; Max-Age=2592000",
+        location: BASE + "/",
+      })
+      res.end()
+      return
+    }
+    if (!path.startsWith("/s/") && !authed(req, url)) {
+      if (path.startsWith("/api/")) return fail(res, 401, "unauthorized")
+      res.writeHead(401, { "content-type": "text/html; charset=utf-8" })
+      res.end(loginPage())
+      return
+    }
+  }
+
+  if (method === "GET" && path.startsWith("/api/events")) {
+    subscribe(req, res)
+    return
+  }
+
+  if (method === "GET" && path === "/api/state") {
+    return sendJson(res, 200, { stats: stats(), inbox: inboxSummary() })
+  }
+
+  if (method === "GET" && path === "/api/files") {
+    const parent = url.searchParams.get("parent") || null
+    if (parent) {
+      const exists = db.prepare("SELECT 1 FROM nodes WHERE id = ? AND deleted = 0").get(parent)
+      if (!exists) return fail(res, 404, "folder not found")
+    }
+    const rows = db.prepare("SELECT id, name, kind, size, blob_hash, mtime FROM nodes WHERE parent_id IS ? AND deleted = 0 AND id <> 'inbox' ORDER BY (kind = 'folder') DESC, name COLLATE NOCASE ASC").all(parent) as any[]
+    const crumbs: Array<{ id: string; name: string }> = []
+    let cur = parent
+    let guard = 0
+    while (cur && guard++ < 64) {
+      const row = db.prepare("SELECT id, parent_id, name FROM nodes WHERE id = ?").get(cur) as any
+      if (!row) break
+      crumbs.unshift({ id: row.id, name: row.name })
+      cur = row.parent_id
+    }
+    return sendJson(res, 200, {
+      parent,
+      breadcrumb: crumbs,
+      items: rows.map((r) => ({ id: r.id, name: r.name, kind: r.kind, size: r.size, hash: r.blob_hash, mtime: r.mtime })),
+    })
+  }
+
+  if (method === "POST" && path === "/api/folders") {
+    const body = await readJson(req)
+    const id = createNode("folder", sanitizeName(body.name), body.parentId || null, 0, null)
+    return sendJson(res, 200, { id })
+  }
+
+  if (method === "POST" && path === "/api/upload/init") {
+    const body = await readJson(req)
+    const name = sanitizeName(body.name)
+    const size = Number(body.size ?? 0)
+    const hash = typeof body.hash === "string" && /^[a-f0-9]{64}$/.test(body.hash) ? body.hash : null
+    const parentId = body.parentId || null
+    const expiresAt = parentId === INBOX ? Date.now() + INBOX_TTL : null
+    if (hash) {
+      const blob = db.prepare("SELECT 1 FROM blobs WHERE hash = ?").get(hash)
+      if (blob && (await fileExists(blobPath(BLOBS, hash)))) {
+        if (parentId === INBOX) {
+          const existing = db.prepare("SELECT id FROM nodes WHERE parent_id = ? AND blob_hash = ? AND deleted = 0 AND kind = 'file'").get(INBOX, hash) as any
+          if (existing) {
+            db.prepare("UPDATE nodes SET mtime = ?, expires_at = ? WHERE id = ?").run(Date.now(), Date.now() + INBOX_TTL, existing.id)
+            broadcast("inbox", { name, size })
+            return sendJson(res, 200, { instant: true, nodeId: existing.id, duplicated: true })
+          }
+        }
+        const nodeId = createFileNode(name, parentId, size, hash, expiresAt)
+        if (parentId === INBOX) broadcast("inbox", { name, size })
+        else broadcast("files", { nodeId })
+        return sendJson(res, 200, { instant: true, nodeId })
+      }
+    }
+    const id = randomUUID()
+    const upload: Upload = { id, name, parentId, size, hash, path: join(TMP, id + ".part"), received: 0 }
+    uploads.set(id, upload)
+    return sendJson(res, 200, { instant: false, uploadId: id, chunkSize: CHUNK })
+  }
+
+  const chunkMatch = /^\/api\/upload\/([0-9a-f-]+)$/.exec(path)
+  if (chunkMatch && (method === "PUT" || method === "GET")) {
+    const upload = uploads.get(chunkMatch[1])
+    if (!upload) return fail(res, 404, "upload not found")
+    if (method === "GET") return sendJson(res, 200, { received: upload.received, size: upload.size })
+    const offset = Number(url.searchParams.get("offset") ?? 0)
+    const buf = await readBody(req, CHUNK + 1024)
+    if (buf.length === 0) return sendJson(res, 200, { received: upload.received })
+    if (offset + buf.length > upload.size + 1024) return fail(res, 400, "chunk exceeds declared size")
+    const fh = await openFd(upload.path, "a+")
+    try {
+      await fh.write(buf, 0, buf.length, offset)
+    } finally {
+      await fh.close()
+    }
+    upload.received = Math.max(upload.received, offset + buf.length)
+    return sendJson(res, 200, { received: upload.received })
+  }
+
+  const completeMatch = /^\/api\/upload\/([0-9a-f-]+)\/complete$/.exec(path)
+  if (completeMatch && method === "POST") {
+    const upload = uploads.get(completeMatch[1])
+    if (!upload) return fail(res, 404, "upload not found")
+    uploads.delete(upload.id)
+    if (upload.size === 0 && !(await fileExists(upload.path))) await writeFile(upload.path, Buffer.alloc(0))
+    const info = await stat(upload.path)
+    if (upload.size > 0 && info.size !== upload.size) {
+      await removeQuiet(upload.path)
+      return fail(res, 400, "size mismatch: sent " + info.size + " expected " + upload.size)
+    }
+    const actual = await hashFile(upload.path)
+    if (upload.hash && upload.hash !== actual) {
+      await removeQuiet(upload.path)
+      return fail(res, 400, "hash mismatch")
+    }
+    const target = blobPath(BLOBS, actual)
+    await ensureParent(target)
+    if (await fileExists(target)) {
+      await removeQuiet(upload.path)
+    } else {
+      await rename(upload.path, target)
+    }
+    const toInbox = upload.parentId === INBOX
+    if (toInbox) {
+      const existing = db.prepare("SELECT id FROM nodes WHERE parent_id = ? AND blob_hash = ? AND deleted = 0 AND kind = 'file'").get(INBOX, actual) as any
+      if (existing) {
+        db.prepare("UPDATE nodes SET mtime = ?, expires_at = ? WHERE id = ?").run(Date.now(), Date.now() + INBOX_TTL, existing.id)
+        broadcast("inbox", { name: upload.name, size: info.size })
+        return sendJson(res, 200, { nodeId: existing.id, hash: actual, size: info.size, instant: false, duplicated: true })
+      }
+    }
+    const nodeId = createFileNode(upload.name, upload.parentId, info.size, actual, toInbox ? Date.now() + INBOX_TTL : null)
+    if (toInbox) broadcast("inbox", { name: upload.name, size: info.size })
+    else broadcast("files", { nodeId })
+    return sendJson(res, 200, { nodeId, hash: actual, size: info.size, instant: false })
+  }
+
+  if (method === "GET" && path === "/api/pair-url") {
+    const proto = String(req.headers["x-forwarded-proto"] ?? "http").split(",")[0].trim() || "http"
+    const host = String(req.headers["x-forwarded-host"] ?? req.headers.host ?? "localhost").split(",")[0].trim()
+    const suffix = TOKEN ? "/?token=" + encodeURIComponent(TOKEN) : "/"
+    return sendJson(res, 200, { url: proto + "://" + host + BASE + suffix })
+  }
+
+  const renameMatch = /^\/api\/nodes\/([0-9a-f-]+)\/rename$/.exec(path)
+  if (renameMatch && method === "POST") {
+    const body = await readJson(req)
+    const node = db.prepare("SELECT id, name, parent_id FROM nodes WHERE id = ? AND deleted = 0").get(renameMatch[1]) as any
+    if (!node) return fail(res, 404, "not found")
+    if (node.id === INBOX) return fail(res, 400, "传输站不能改名")
+    const name = sanitizeName(body.name)
+    if (name === node.name) return sendJson(res, 200, { ok: true, name })
+    const finalName = uniqueName(node.parent_id, name)
+    db.prepare("UPDATE nodes SET name = ?, mtime = ? WHERE id = ?").run(finalName, Date.now(), node.id)
+    broadcast("files", { renamed: node.id })
+    return sendJson(res, 200, { ok: true, name: finalName })
+  }
+
+  const moveMatch = /^\/api\/nodes\/([0-9a-f-]+)\/move$/.exec(path)
+  if (moveMatch && method === "POST") {
+    const body = await readJson(req)
+    const target = body.parentId || null
+    const node = db.prepare("SELECT id, name, parent_id FROM nodes WHERE id = ? AND deleted = 0").get(moveMatch[1]) as any
+    if (!node) return fail(res, 404, "not found")
+    if (target === INBOX) return fail(res, 400, "不能移动到传输站")
+    if (target) {
+      const parent = db.prepare("SELECT id, kind FROM nodes WHERE id = ? AND deleted = 0").get(target) as any
+      if (!parent || parent.kind !== "folder") return fail(res, 400, "目标不是文件夹")
+      let cursor: string | null = target
+      let guard = 0
+      while (cursor && guard++ < 200) {
+        if (cursor === node.id) return fail(res, 400, "不能移动到自己或自己的子文件夹")
+        const row = db.prepare("SELECT parent_id FROM nodes WHERE id = ?").get(cursor) as any
+        cursor = row ? row.parent_id : null
+      }
+    }
+    if ((node.parent_id ?? null) === target) return sendJson(res, 200, { ok: true, name: node.name, unchanged: true })
+    const name = uniqueName(target, node.name)
+    db.prepare("UPDATE nodes SET parent_id = ?, name = ?, mtime = ? WHERE id = ?").run(target, name, Date.now(), node.id)
+    broadcast("files", { moved: node.id })
+    return sendJson(res, 200, { ok: true, name })
+  }
+
+  const deleteMatch = /^\/api\/nodes\/([0-9a-f-]+)$/.exec(path)
+  if (deleteMatch && method === "DELETE") {
+    const node = db.prepare("SELECT 1 FROM nodes WHERE id = ? AND deleted = 0").get(deleteMatch[1])
+    if (!node) return fail(res, 404, "not found")
+    deleteTree(deleteMatch[1])
+    broadcast("files", { deleted: deleteMatch[1] })
+    return sendJson(res, 200, { ok: true })
+  }
+
+  if (method === "GET" && path === "/api/inbox") {
+    const rows = db.prepare("SELECT id, name, size, mtime, expires_at FROM nodes WHERE parent_id = ? AND deleted = 0 AND kind = 'file' ORDER BY mtime DESC LIMIT 100").all(INBOX) as any[]
+    return sendJson(res, 200, {
+      items: rows.map((r) => ({ id: r.id, name: r.name, size: r.size, at: r.mtime, expiresAt: r.expires_at })),
+      ttlHours: INBOX_TTL_H,
+    })
+  }
+
+  const downloadMatch = /^\/api\/download\/([0-9a-f-]+)$/.exec(path)
+  if (downloadMatch && method === "GET") {
+    const row = db.prepare("SELECT id, name, blob_hash FROM nodes WHERE id = ? AND deleted = 0 AND kind = 'file'").get(downloadMatch[1]) as any
+    if (!row || !row.blob_hash) return fail(res, 404, "not found")
+    const file = blobPath(BLOBS, row.blob_hash)
+    if (!(await fileExists(file))) return fail(res, 410, "blob missing")
+    if (url.searchParams.get("burn") === "1") {
+      res.on("finish", () => {
+        deleteTree(row.id)
+        broadcast("files", { deleted: row.id })
+      })
+    }
+    return streamFile(req, res, file, row.name)
+  }
+
+  if (method === "POST" && path === "/api/shares") {
+    const body = await readJson(req)
+    const node = db.prepare("SELECT id, kind FROM nodes WHERE id = ? AND deleted = 0").get(body.nodeId) as any
+    if (!node) return fail(res, 404, "not found")
+    if (node.kind !== "file") return fail(res, 400, "only files can be shared for now")
+    const hours = Number(body.ttlHours ?? 0)
+    const expiresAt = hours > 0 ? Date.now() + hours * 3600 * 1000 : null
+    const token = randomBytes(12).toString("base64url")
+    db.prepare("INSERT INTO shares (token, node_id, expires_at, created_at, downloads) VALUES (?, ?, ?, ?, 0)").run(token, node.id, expiresAt, Date.now())
+    return sendJson(res, 200, { token, expiresAt, url: BASE + "/s/" + token })
+  }
+
+  if (method === "GET" && path === "/api/shares") {
+    const rows = db.prepare("SELECT s.token, s.expires_at, s.created_at, s.downloads, n.name, n.size FROM shares s JOIN nodes n ON n.id = s.node_id WHERE n.deleted = 0 ORDER BY s.created_at DESC LIMIT 100").all() as any[]
+    return sendJson(res, 200, {
+      items: rows.map((r) => ({ token: r.token, name: r.name, size: r.size, expiresAt: r.expires_at, createdAt: r.created_at, downloads: r.downloads, url: BASE + "/s/" + r.token, expired: r.expires_at !== null && r.expires_at < Date.now() })),
+    })
+  }
+
+  const shareDel = /^\/api\/shares\/([A-Za-z0-9_-]+)$/.exec(path)
+  if (shareDel && method === "DELETE") {
+    db.prepare("DELETE FROM shares WHERE token = ?").run(shareDel[1])
+    return sendJson(res, 200, { ok: true })
+  }
+
+  const pubMatch = /^\/s\/([A-Za-z0-9_-]+)(\/download)?$/.exec(path)
+  if (pubMatch && method === "GET") {
+    const row = db.prepare("SELECT s.token, s.expires_at, s.node_id, n.name, n.size, n.blob_hash FROM shares s JOIN nodes n ON n.id = s.node_id WHERE s.token = ? AND n.deleted = 0").get(pubMatch[1]) as any
+    if (!row) {
+      res.writeHead(404, { "content-type": "text/html; charset=utf-8" })
+      res.end("<!doctype html><meta charset=utf-8><body style=\"background:#f5f5f7;color:#6e6e73;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;display:grid;place-items:center;height:100vh;margin:0\">链接不存在或已被删除</body>")
+      return
+    }
+    if (row.expires_at !== null && row.expires_at < Date.now()) {
+      res.writeHead(410, { "content-type": "text/html; charset=utf-8" })
+      res.end("<!doctype html><meta charset=utf-8><body style=\"background:#f5f5f7;color:#6e6e73;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;display:grid;place-items:center;height:100vh;margin:0\">链接已过期</body>")
+      return
+    }
+    if (pubMatch[2]) {
+      db.prepare("UPDATE shares SET downloads = downloads + 1 WHERE token = ?").run(row.token)
+      const file = blobPath(BLOBS, row.blob_hash)
+      if (!(await fileExists(file))) return fail(res, 410, "blob missing")
+      return streamFile(req, res, file, row.name)
+    }
+    const html = sharePage(row.name, row.size, row.token, row.expires_at)
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(html) })
+    res.end(html)
+    return
+  }
+
+  if (method === "GET") return serveStatic(req, res, path)
+  return fail(res, 404, "not found")
+}
+
+const server = http.createServer((req, res) => {
+  const started = Date.now()
+  handle(req, res)
+    .catch((err: any) => {
+      if (!res.headersSent) fail(res, 500, err?.message ?? "internal error")
+      else res.end()
+      console.error("[error]", req.method, req.url, err?.message)
+    })
+    .finally(() => {
+      const status = res.statusCode
+      console.log(req.method, req.url, status, Date.now() - started + "ms")
+    })
+})
+
+setInterval(async () => {
+  for (const res of subs) res.write(": ping\n\n")
+  const now = Date.now()
+  try {
+    const orphans = db.prepare("SELECT hash FROM blobs WHERE refs <= 0 AND created_at < ?").all(now - 3600 * 1000) as any[]
+    for (const row of orphans) {
+      await removeQuiet(blobPath(BLOBS, row.hash))
+      db.prepare("DELETE FROM blobs WHERE hash = ?").run(row.hash)
+    }
+  } catch (err: any) {
+    console.error("[gc]", err?.message)
+  }
+  db.prepare("DELETE FROM shares WHERE expires_at IS NOT NULL AND expires_at < ?").run(now)
+  const expired = db.prepare("SELECT id FROM nodes WHERE expires_at IS NOT NULL AND expires_at < ? AND deleted = 0").all(now) as any[]
+  for (const row of expired) deleteTree(row.id)
+}, 30000).unref()
+
+server.listen(PORT, HOST, () => {
+  console.log("DriveSend listening on http://" + HOST + ":" + PORT)
+  console.log("data dir: " + DATA)
+})

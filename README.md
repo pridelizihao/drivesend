@@ -1,0 +1,249 @@
+# DriveSend
+
+> 自托管的文件中心。网盘与「即时传输助手」不是两个产品，是同一套内核的两种策略。
+
+<p>
+  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D22.5-339933?logo=node.js&logoColor=white">
+  <img alt="deps" src="https://img.shields.io/badge/npm%20dependencies-1-blue">
+  <img alt="storage" src="https://img.shields.io/badge/storage-content--addressed-8b5cf6">
+  <img alt="frontend" src="https://img.shields.io/badge/frontend-zero--build-0ea5e9">
+  <img alt="license" src="https://img.shields.io/badge/license-AGPL--3.0-3da639">
+</p>
+
+## 一句话说清
+
+**一次传输 = 一个带 TTL 的目录；网盘 = TTL 为 ∞ 的那一种。**
+
+所以这个项目里没有两套系统：一套内容寻址存储、一套元数据、一条传输通道，
+外挂两种策略对象——永久可浏览的目录树，和 24 小时后自动消失的「传输站」。
+
+## 为什么
+
+手机拍完照想立刻在电脑上看到，用网盘要「上传 → 打开电脑端 → 找文件夹 → 下载」四步；
+用传输助手两步就够了，但传完的东西不是你的，不能整理、不能分享。
+
+两者的差别其实只有**生命周期**，其余全部重合。既然如此，就没必要写两遍。
+
+| 维度 | 网盘形态 | 传输站形态 | 是否复用 |
+| --- | --- | --- | --- |
+| 数据面 | 内容寻址分块存储 | 同一份存储 | 复用 |
+| 控制面 | 目录树 / 版本 | TTL / 领取即删 | 同一套节点模型 |
+| 传输 | 分块续传、秒传、Range | 同一套 | 复用 |
+| 生命周期 | 永久 | 24 小时（可配） | 只差一个字段 |
+| 交互 | 主动浏览 | 实时推送 + 领取 | 客户端能力 |
+
+## 功能
+
+| 能力 | 说明 |
+| --- | --- |
+| 内容寻址去重 | 同一内容只存一份，重复上传走「秒传」，一个字节都不用传 |
+| 分块上传 | 4 MiB 分块，按偏移写入，支持重传同一块 |
+| 断点下载 | 标准 HTTP Range（206），大文件可续传 |
+| 传输站 | 手机上传 → 其他设备实时弹通知 → 「保存」或「保存并删除」 |
+| 分享链接 | 1 小时 / 24 小时 / 7 天 / 永久，独立落地页，可撤销 |
+| 文件管理 | 目录树、新建文件夹、重命名、拖拽移动、软删除 |
+| 手机配对 | 传输站内生成二维码，扫码直接登录，无需输入令牌 |
+| 存储统计 | 区分「逻辑占用」与「实际占用」，直观看到去重省了多少 |
+
+界面为 iOS / macOS 风格的磨砂玻璃主题，零构建、零框架。
+
+## 快速开始
+
+需要 Node.js 22.5 以上（依赖内置 `node:sqlite`）。
+
+```bash
+git clone git@github.com:pridelizihao/drivesend.git
+cd drivesend
+node src/server.ts
+```
+
+打开 http://127.0.0.1:8787 即可。默认无鉴权，仅供本机使用。
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PORT` | `8787` | 监听端口 |
+| `HOST` | `127.0.0.1` | 监听地址 |
+| `DATA_DIR` | `./data` | 数据目录（SQLite + blob 存储） |
+| `DS_TOKEN` | 空 | 访问令牌。公网部署必须设置，留空即无鉴权 |
+| `BASE_PATH` | 空 | 子路径部署前缀，如 `/drive` |
+| `INBOX_TTL_H` | `24` | 传输站文件存活小时数 |
+
+## 架构
+
+```
+          客户端（桌面浏览器 / 手机浏览器）
+  ┌──────────────────────────────────────────────┐
+  │  零构建前端 · 拖拽上传 · EventSource 实时推送  │
+  └───────┬──────────────────────────────┬───────┘
+          │ HTTP / HTTPS                 │ SSE
+          ▼                              ▼
+  ┌──────────────────────────────────────────────┐
+  │  接入层  单进程 http.Server，无框架路由        │
+  │  鉴权    令牌 + Cookie + Bearer                │
+  │  传输    分块上传 · Range 下载 · 秒传判定      │
+  ├──────────────────────────────────────────────┤
+  │  元数据  SQLite（node:sqlite，进程内）         │
+  │          blobs / nodes / shares               │
+  ├──────────────────────────────────────────────┤
+  │  存储    内容寻址：blobs/<aa>/<bb>/<sha256>    │
+  │          引用计数 + 孤儿回收                   │
+  └──────────────────────────────────────────────┘
+```
+
+### 几个关键实现
+
+**内容寻址。** 文件按 SHA-256 落盘，路径由哈希推导，由此免费获得去重、秒传、完整性校验。
+配合 `blobs.refs` 引用计数，节点全部删除后引用归零，超过 1 小时再由后台任务回收物理文件。
+
+**简化版 tus 上传。** `PUT /api/upload/:id?offset=N` 写入裸字节，客户端失败可重传同一块；
+完成时服务端重新计算哈希并与客户端声明值比对，防止传输损坏。
+
+**SSE 而不是 WebSocket。** 只需要服务端单向推送时，SSE 是一个普通 HTTP 响应，浏览器自带重连。
+代价是反向代理必须关闭缓冲（`proxy_buffering off`）。
+
+**纯 JS 流式 SHA-256 兜底。** 浏览器 `crypto.subtle` 只在安全上下文（HTTPS / localhost）可用，
+HTTP 部署下它不存在。因此内置了一份增量式 SHA-256（常数内存，边界长度已与原实现逐字节对齐），
+让秒传在纯 HTTP 环境下依然可用。
+
+## 数据模型
+
+| 表 | 关键字段 | 说明 |
+| --- | --- | --- |
+| `blobs` | `hash` · `size` · `refs` | 物理内容，全局唯一 |
+| `nodes` | `id` · `parent_id` · `name` · `kind` · `blob_hash` · `expires_at` · `deleted` | 目录树，文件与文件夹统一建模 |
+| `shares` | `token` · `node_id` · `expires_at` | 分享链接 |
+
+目录树使用邻接表；移动只改一个字段，删除为软删除 + 引用计数递减。
+
+## API
+
+```
+POST   /api/upload/init            秒传判定 / 开启上传会话
+PUT    /api/upload/:id?offset=     写入一个分块（原始字节）
+POST   /api/upload/:id/complete    校验哈希 → 落 CAS → 建节点
+GET    /api/download/:id           下载，支持 Range
+GET    /api/download/:id?burn=1    下载完成后立即删除（传输站领取）
+
+GET    /api/files?parent=          列目录 + 面包屑
+POST   /api/folders                新建文件夹
+POST   /api/nodes/:id/rename       重命名
+POST   /api/nodes/:id/move         移动（防环、重名自动加序号）
+DELETE /api/nodes/:id              递归软删除
+
+GET    /api/inbox                  传输站列表
+POST   /api/shares                 创建分享链接
+GET    /api/shares                 链接列表
+DELETE /api/shares/:token          撤销链接
+GET    /s/:token                   分享落地页
+
+GET    /api/state                  统计信息
+GET    /api/pair-url               生成带令牌的登录地址（供二维码）
+GET    /api/events                 SSE：inbox / files 事件
+```
+
+## 部署
+
+以 systemd + nginx 反向代理为例。
+
+```ini
+# /etc/systemd/system/drivesend.service
+[Unit]
+Description=DriveSend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/drivesend
+Environment=PORT=8787
+Environment=HOST=127.0.0.1
+Environment=DATA_DIR=/opt/drivesend/data
+Environment=BASE_PATH=/drive
+Environment=DS_TOKEN=请替换为随机令牌
+ExecStart=/usr/bin/node src/server.ts
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```nginx
+location = /drive { return 301 /drive/; }
+
+location /drive/ {
+    proxy_pass http://127.0.0.1:8787/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;        # SSE 必须关闭缓冲
+    proxy_read_timeout 3600s;
+    client_max_body_size 64m;
+}
+```
+
+`proxy_pass` 结尾的斜杠会剥掉 `/drive` 前缀；服务端的 `BASE_PATH` 负责生成正确的绝对链接与 Cookie 路径。
+两者必须成对配置，否则登录跳转会指向错误位置。
+
+## 安全模型
+
+- 单个访问令牌保护所有 API。首次访问 `/?token=xxx` 后写入 HttpOnly Cookie，有效期 30 天。
+- **分享链接不需要令牌**——这是分享的语义。令牌为 96 位随机串，无法猜测，但链接一旦转发即等同放行。
+- 传输站文件默认 24 小时过期，领取即可删除。
+- 当前无内置 TLS。公网部署请在前面加一层 HTTPS，否则令牌与文件内容均为明文传输。
+
+## 设计取舍
+
+| 决策 | 理由 | 代价 |
+| --- | --- | --- |
+| 整文件级内容寻址，而非块级 | 秒传、去重、校验一次到位 | 改一个字节要重传整个文件 |
+| 简化版 tus 语义，而非标准 tus | 六十行代码解决问题 | 标准 tus 客户端不能直接使用 |
+| SQLite 单文件数据库 | 零运维，单机足够 | 水平扩展需要换 Postgres |
+| 前端零构建、无框架 | 改完刷新即生效 | 状态管理手写，规模再大需要重构 |
+| SSE 而非 WebSocket | 只需要单向推送 | 双向实时协作场景不适用 |
+| 单用户模型 | 自托管场景绝大多数是单人 | 多用户需增加 owner_id 与配额 |
+
+## 测试
+
+仓库内是可直接运行的端到端测试，不依赖任何测试框架：
+
+```bash
+node test/smoke.mjs      # 网盘主流程（19 项断言）
+node test/inbox.mjs      # 传输站流程（10 项断言）
+node test/move.mjs       # 移动与防环规则（9 项断言）
+node test/sha256.mjs     # 纯 JS SHA-256 与原生实现比对
+```
+
+针对已部署实例运行时，传入 `BASE` 与 `DS_AUTH`：
+
+```bash
+BASE=https://drive.example.com/drive DS_AUTH=<token> node test/smoke.mjs
+```
+
+## 路线图
+
+- [x] 内容寻址存储与引用计数
+- [x] 分块上传、秒传、Range 下载
+- [x] 传输站（TTL、实时推送、领取即删）
+- [x] 分享链接、移动、重命名、二维码配对
+- [ ] 局域网直连（mDNS 发现 + 不经服务器的直传）
+- [ ] 块级去重与增量同步
+- [ ] 回收站
+- [ ] 多用户与配额
+- [ ] HTTPS 一键配置
+
+## 贡献者
+
+- **李子豪** — 产品设计与实现 · [@pridelizihao](https://github.com/pridelizihao)
+- **DeepSeek AI** — 协同开发与测试 · [@deepseek-aibot](https://github.com/deepseek-aibot)
+
+## 许可证
+
+[AGPL-3.0-or-later](./LICENSE)。
+
+可以自由使用、修改、分发。但如果你修改后**把它作为网络服务提供给他人访问**，
+必须同样以 AGPL-3.0 公开你的修改源码。这是有意的选择：这套东西的定位就是自托管工具，
+不应该被改造成一个不透明的收费网盘。
