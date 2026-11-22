@@ -160,6 +160,8 @@ POST   /api/nodes/:id/move         移动（防环、重名自动加序号）
 DELETE /api/nodes/:id              删除，进入回收站
 DELETE /api/nodes/:id?purge=1      永久删除（不经过回收站）
 POST   /api/nodes/:id/restore      从回收站恢复
+GET    /api/nodes/:id/versions     历史版本列表
+GET    /view/:id                   独立阅读页（原生 PDF 阅读器 + 上传新版本）
 GET    /api/trash                  回收站列表
 DELETE /api/trash                  清空回收站
 GET    /api/search?q=              按文件名搜索
@@ -243,7 +245,9 @@ location /drive/ {
 | SQLite 单文件数据库 | 零运维，单机足够 | 水平扩展需要换 Postgres |
 | 前端零构建、无框架 | 改完刷新即生效 | 状态管理手写，规模再大需要重构 |
 | 缩略图由浏览器缩放原图 | 不引入图片库，保持零依赖 | 会下载完整文件；图片多的目录首次加载偏慢 |
-| PDF 渲染用 pdf.js（随仓库分发） | 浏览器无法把 PDF 直接画成缩略图，必须真渲染 | 增加约 1.4 MB 静态资源，仅按需下载 |
+| PDF 渲染用 pdf.js（随仓库分发） | 列表缩略图必须真渲染，浏览器做不到 | 增加约 1.4 MB 静态资源 |
+| PDF 预览交给浏览器原生阅读器 | 原生阅读器自带缩放、搜索、目录，自绘很难追平 | 浏览器不会把批注写回文件，只能"另存为后上传新版本" |
+| 替换版本保留旧内容 | 编辑传回时不会丢东西 | 旧版本常驻磁盘，暂未提供清理入口 |
 | PDF 渲染用 pdf.js（随仓库分发） | 浏览器无法把 PDF 直接画成缩略图，必须真渲染 | 增加约 1.4 MB 静态资源，仅 PDF 场景才下载 |
 | SSE 而非 WebSocket | 只需要单向推送 | 双向实时协作场景不适用 |
 | 单用户模型 | 自托管场景绝大多数是单人 | 多用户需增加 owner_id 与配额 |
@@ -260,6 +264,7 @@ node test/trash.mjs      # 回收站、恢复、搜索（16 项断言）
 node test/delete.mjs     # 删除语义与空间回收（9 项断言）
 node test/preview.mjs    # 预览内联白名单与安全头
 node test/auth.mjs       # 账户、会话与配额（21 项断言）
+node test/version.mjs    # 版本替换与阅读页（11 项断言）
 node test/sha256.mjs     # 纯 JS SHA-256 与原生实现比对
 ```
 
@@ -277,6 +282,7 @@ BASE=https://drive.example.com/drive DS_AUTH=<token> node test/smoke.mjs
 - [x] 分享链接、移动、重命名、二维码配对
 - [x] 回收站、全盘搜索、多选批量操作
 - [x] 在线预览（图片 / PDF / 音视频 / 文本）
+- [x] PDF 独立阅读页与版本替换
 - [x] 账号密码登录、存储配额
 - [ ] 局域网直连（mDNS 发现 + 不经服务器的直传）
 - [ ] 块级去重与增量同步

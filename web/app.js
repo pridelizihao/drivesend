@@ -90,6 +90,7 @@ const ICON_PATHS = {
   move: "M3.2 7.2a1.8 1.8 0 011.8-1.8h3.6l1.8 1.8h8.4a1.8 1.8 0 011.8 1.8v7.2a1.8 1.8 0 01-1.8 1.8H5a1.8 1.8 0 01-1.8-1.8V7.2zM12 10.6v4.6m0 0l-2-2m2 2l2-2",
   rename: "M4 20h4.2L19 9.2a2.1 2.1 0 00-3-3L5.2 17 4 20zM14.5 7.5l3 3",
   restore: "M4 12a8 8 0 108-8M4 12V6m0 6h6",
+  open: "M14 4h6m0 0v6m0-6l-8 8M9 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-3",
 }
 
 function opBtn(kind, title, onclick, variant) {
@@ -319,7 +320,9 @@ function openPreview(item, siblings) {
       if (kind === "image") {
         stage.append(el("img", { src: url, alt: current.name }))
       } else if (kind === "pdf") {
-        renderPdfViewer(stage, modal, current, api)
+        window.open("view/" + current.id, "_blank", "noopener")
+        close()
+        return
       } else if (kind === "video") {
         const video = document.createElement("video")
         video.src = url
@@ -378,114 +381,6 @@ function openPreview(item, siblings) {
     body.append(prev, next)
     show(index)
   })
-}
-
-function renderPdfViewer(stage, modal, item, api) {
-  modal.classList.add("preview-pdf")
-  stage.classList.add("pdf-stage")
-  stage.innerHTML = ""
-
-  const canvas = document.createElement("canvas")
-  const holder = el("div", { class: "pdf-canvas-holder" }, [canvas])
-  const pageLabel = el("span", { class: "pdf-page", text: "…" })
-  const zoomLabel = el("span", { class: "pdf-zoom", text: "100%" })
-  const bar = el("div", { class: "pdf-toolbar" }, [
-    el("button", { class: "pdf-btn", text: "−", onclick: () => setZoom(zoom / 1.25) }),
-    zoomLabel,
-    el("button", { class: "pdf-btn", text: "+", onclick: () => setZoom(zoom * 1.25) }),
-    el("span", { class: "pdf-sep" }),
-    el("button", { class: "pdf-btn", text: "‹", onclick: () => setPage(page - 1) }),
-    pageLabel,
-    el("button", { class: "pdf-btn", text: "›", onclick: () => setPage(page + 1) }),
-    el("span", { class: "pdf-sep" }),
-    el("button", { class: "pdf-btn wide", text: "适应宽度", onclick: () => { fitWidth = true; setZoom(1) } }),
-    el("a", { class: "pdf-btn wide", href: "api/download/" + item.id, target: "_blank", rel: "noopener", text: "原始文件" }),
-  ])
-  stage.append(bar, holder)
-
-  let doc = null
-  let page = 1
-  let zoom = 1
-  let fitWidth = true
-  let renderTask = null
-  let destroyed = false
-
-  function setZoom(next) {
-    zoom = Math.min(6, Math.max(0.2, next))
-    fitWidth = false
-    draw()
-  }
-
-  function setPage(next) {
-    if (!doc) return
-    page = Math.min(doc.numPages, Math.max(1, next))
-    draw()
-  }
-
-  async function draw() {
-    if (!doc) return
-    if (renderTask) {
-      try { renderTask.cancel() } catch (err) { /* ignore */ }
-      renderTask = null
-    }
-    const pdfPage = await doc.getPage(page)
-    if (destroyed) return
-    const base = pdfPage.getViewport({ scale: 1 })
-    const available = Math.max(320, holder.clientWidth - 4)
-    const scale = fitWidth ? available / base.width : (available / base.width) * zoom
-    const dpr = Math.min(2, window.devicePixelRatio || 1)
-    const viewport = pdfPage.getViewport({ scale: scale * dpr })
-    canvas.width = Math.floor(viewport.width)
-    canvas.height = Math.floor(viewport.height)
-    canvas.style.width = Math.floor(viewport.width / dpr) + "px"
-    canvas.style.height = Math.floor(viewport.height / dpr) + "px"
-    const ctx = canvas.getContext("2d")
-    ctx.fillStyle = "#fff"
-    ctx.fillRect(0, 0, canvas.width, canvas.height)
-    try {
-      renderTask = pdfPage.render({ canvasContext: ctx, viewport })
-      await renderTask.promise
-    } catch (err) {
-      if (err && err.name === "RenderingCancelledException") return
-    }
-    renderTask = null
-    pageLabel.textContent = page + " / " + doc.numPages
-    zoomLabel.textContent = Math.round((fitWidth ? available / base.width : zoom) * 100) + "%"
-  }
-
-  stage.addEventListener("wheel", (event) => {
-    if (!event.ctrlKey && !event.metaKey) return
-    event.preventDefault()
-    setZoom(zoom * (event.deltaY < 0 ? 1.1 : 0.9))
-  }, { passive: false })
-
-  const onKey = (event) => {
-    if (event.key === "PageDown" || event.key === "ArrowDown") { event.preventDefault(); setPage(page + 1) }
-    if (event.key === "PageUp" || event.key === "ArrowUp") { event.preventDefault(); setPage(page - 1) }
-    if (event.key === "+" || event.key === "=") { event.preventDefault(); setZoom(zoom * 1.25) }
-    if (event.key === "-") { event.preventDefault(); setZoom(zoom / 1.25) }
-  }
-  document.addEventListener("keydown", onKey)
-  api.onClose(() => {
-    destroyed = true
-    document.removeEventListener("keydown", onKey)
-    if (doc) doc.destroy().catch(() => {})
-  })
-
-  loadPdfDoc(item.id)
-    .then((loaded) => {
-      if (destroyed) return
-      doc = loaded
-      page = 1
-      draw()
-    })
-    .catch(() => {
-      holder.innerHTML = ""
-      holder.append(el("div", { class: "preview-empty" }, [
-        el("div", { text: "PDF 加载失败" }),
-        el("a", { class: "btn small", href: "api/download/" + item.id, text: "下载" }),
-      ]))
-    })
 }
 
 function openShare(item) {
@@ -939,6 +834,9 @@ function renderFiles() {
     if (!isFolder) {
       ops.append(opBtn("download", "下载", () => { window.location.href = "api/download/" + item.id }))
       ops.append(opBtn("share", "分享链接", () => openShare(item)))
+      if (previewKind(item.name) === "pdf") {
+        ops.append(opBtn("open", "在浏览器中打开", () => { window.open("view/" + item.id, "_blank", "noopener") }))
+      }
     }
     ops.append(opBtn("move", "移动到…", () => openMove(item, state.parent)))
     ops.append(opBtn("rename", "重命名", () => openRename(item)))

@@ -39,6 +39,7 @@ type Upload = {
   hash: string | null
   path: string
   received: number
+  replaceNode: string | null
 }
 
 const uploads = new Map<string, Upload>()
@@ -333,6 +334,71 @@ function inboxSummary() {
   return { count: row.c as number, bytes: row.s as number }
 }
 
+function viewerPage(node: any): string {
+  const title = escapeHtml(node.name)
+  return [
+    "<!doctype html>",
+    "<meta charset=\"utf-8\">",
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+    "<title>" + title + "</title>",
+    "<style>",
+    "html,body{margin:0;height:100%;background:#f5f5f7;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','PingFang SC',sans-serif;-webkit-font-smoothing:antialiased}",
+    ".bar{display:flex;align-items:center;gap:10px;padding:8px 14px;background:rgba(255,255,255,.86);backdrop-filter:saturate(180%) blur(20px);border-bottom:1px solid rgba(0,0,0,.07);font-size:13px;color:#1d1d1f}",
+    ".name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}",
+    ".meta{color:#86868b;font-size:12px;flex:0 0 auto}",
+    ".spacer{flex:1}",
+    "button,a.btn{border:1px solid rgba(0,0,0,.07);background:#fff;border-radius:980px;padding:6px 14px;font:inherit;font-size:12px;color:#1d1d1f;cursor:pointer;text-decoration:none;white-space:nowrap}",
+    "button:hover,a.btn:hover{background:#f2f2f5}",
+    ".primary{background:linear-gradient(180deg,#0a84ff,#0071e3);color:#fff;border:0}",
+    ".primary:hover{filter:brightness(1.06);background:linear-gradient(180deg,#0a84ff,#0071e3)}",
+    "iframe{display:block;width:100%;height:calc(100vh - 49px);border:0;background:#525659}",
+    ".toast{position:fixed;left:50%;top:56px;transform:translateX(-50%);background:rgba(255,255,255,.96);border:1px solid rgba(0,0,0,.08);border-radius:12px;padding:9px 16px;font-size:13px;box-shadow:0 10px 30px rgba(0,0,0,.12);display:none}",
+    "</style>",
+    "<div class=\"bar\">",
+    "<a class=\"btn\" href=\"" + BASE + "/\">‹ 返回</a>",
+    "<span class=\"name\">" + title + "</span>",
+    "<span class=\"meta\">" + humanSize(node.size) + "</span>",
+    "<span class=\"spacer\"></span>",
+    "<button id=\"verBtn\">历史版本</button>",
+    "<label class=\"primary\" style=\"border-radius:980px;padding:6px 14px;font-size:12px;cursor:pointer;display:inline-block\">上传新版本<input id=\"file\" type=\"file\" hidden></label>",
+    "<a class=\"btn\" href=\"" + BASE + "/api/download/" + node.id + "\">下载</a>",
+    "</div>",
+    "<iframe id=\"frame\" src=\"" + BASE + "/api/download/" + node.id + "?inline=1\" title=\"" + title + "\"></iframe>",
+    "<div class=\"toast\" id=\"toast\"></div>",
+    "<script>",
+    "const BASE=" + JSON.stringify(BASE) + ";",
+    "const NODE_ID=" + JSON.stringify(node.id) + ";",
+    "const toastEl=document.getElementById('toast');",
+    "function toast(t){toastEl.textContent=t;toastEl.style.display='block';setTimeout(()=>toastEl.style.display='none',3200)}",
+    "document.getElementById('file').addEventListener('change',async(e)=>{",
+    "  const f=e.target.files[0]; if(!f) return;",
+    "  try{",
+    "    toast('正在上传 '+f.name);",
+    "    const init=await (await fetch(BASE+'/api/upload/init',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({name:f.name,size:f.size,replaceNodeId:NODE_ID})})).json();",
+    "    if(!init.uploadId) throw new Error(init.error||'初始化失败');",
+    "    let off=0;",
+    "    while(off<f.size){",
+    "      const part=f.slice(off,Math.min(off+init.chunkSize,f.size));",
+    "      const buf=await part.arrayBuffer();",
+    "      const res=await fetch(BASE+'/api/upload/'+init.uploadId+'?offset='+off,{method:'PUT',body:buf,credentials:'same-origin'});",
+    "      if(!res.ok) throw new Error('分片失败 '+res.status);",
+    "      off+=buf.byteLength;",
+    "    }",
+    "    const done=await (await fetch(BASE+'/api/upload/'+init.uploadId+'/complete',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:'{}'})).json();",
+    "    if(done.error) throw new Error(done.error);",
+    "    toast('已更新');",
+    "    document.getElementById('frame').src=BASE+'/api/download/'+NODE_ID+'?inline=1&t='+Date.now();",
+    "  }catch(err){toast('失败：'+err.message)}",
+    "});",
+    "document.getElementById('verBtn').addEventListener('click',async()=>{",
+    "  const d=await (await fetch(BASE+'/api/nodes/'+NODE_ID+'/versions',{credentials:'same-origin'})).json();",
+    "  const n=d.items?d.items.length:0;",
+    "  toast(n?('共有 '+n+' 个历史版本（旧版本内容保留在服务器）'):'还没有历史版本');",
+    "});",
+    "</script>",
+  ].join("\n")
+}
+
 function loginPage(): string {
   const lines = [
     "<!doctype html>",
@@ -609,6 +675,22 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const hash = typeof body.hash === "string" && /^[a-f0-9]{64}$/.test(body.hash) ? body.hash : null
     const parentId = body.parentId || null
     const expiresAt = parentId === INBOX ? Date.now() + INBOX_TTL : null
+    // Replace mode: overwrite the content of an existing file, keeping its id and moving
+    // the previous blob into versions. This is how "edit locally, upload back" works.
+    let replaceNode: string | null = null
+    if (typeof body.replaceNodeId === "string") {
+      const existing = db.prepare("SELECT id, kind, blob_hash, size FROM nodes WHERE id = ? AND deleted = 0").get(body.replaceNodeId) as any
+      if (!existing) return fail(res, 404, "file not found")
+      if (existing.kind !== "file") return fail(res, 400, "只能替换文件")
+      replaceNode = existing.id
+      const delta = size - (existing.size ?? 0)
+      if (delta > 0 && usedBytes() + delta > QUOTA_BYTES) {
+        return fail(res, 413, "空间不足，仅剩 " + humanSize(Math.max(0, QUOTA_BYTES - usedBytes())))
+      }
+      const id = randomUUID()
+      uploads.set(id, { id, name: existing.id, parentId, size, hash, path: join(TMP, id + ".part"), received: 0, replaceNode })
+      return sendJson(res, 200, { instant: false, uploadId: id, chunkSize: CHUNK, replace: true })
+    }
     const alreadyStored = hash ? (db.prepare("SELECT 1 FROM blobs WHERE hash = ?").get(hash) !== undefined && await fileExists(blobPath(BLOBS, hash as string))) : false
     if (!alreadyStored && usedBytes() + size > QUOTA_BYTES) {
       return fail(res, 413, "空间不足，仅剩 " + humanSize(Math.max(0, QUOTA_BYTES - usedBytes())))
@@ -631,7 +713,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       }
     }
     const id = randomUUID()
-    const upload: Upload = { id, name, parentId, size, hash, path: join(TMP, id + ".part"), received: 0 }
+    const upload: Upload = { id, name, parentId, size, hash, path: join(TMP, id + ".part"), received: 0, replaceNode: replaceNode }
     uploads.set(id, upload)
     return sendJson(res, 200, { instant: false, uploadId: id, chunkSize: CHUNK })
   }
@@ -682,6 +764,20 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       await removeQuiet(upload.path)
       return fail(res, 413, "空间不足")
     }
+    if (upload.replaceNode) {
+      const node = db.prepare("SELECT id, blob_hash, size FROM nodes WHERE id = ?").get(upload.replaceNode) as any
+      if (!node) return fail(res, 404, "file not found")
+      if (node.blob_hash) {
+        db.prepare("INSERT INTO versions (id, node_id, blob_hash, size, created_at) VALUES (?, ?, ?, ?, ?)").run(
+          randomUUID(), node.id, node.blob_hash, node.size ?? 0, Date.now()
+        )
+        db.prepare("UPDATE blobs SET refs = refs - 1 WHERE hash = ?").run(node.blob_hash)
+      }
+      db.prepare("INSERT INTO blobs (hash, size, refs, created_at) VALUES (?, ?, 1, ?) ON CONFLICT(hash) DO UPDATE SET refs = refs + 1").run(actual, info.size, Date.now())
+      db.prepare("UPDATE nodes SET blob_hash = ?, size = ?, mtime = ? WHERE id = ?").run(actual, info.size, Date.now(), node.id)
+      broadcast("files", { replaced: node.id })
+      return sendJson(res, 200, { nodeId: node.id, hash: actual, size: info.size, replaced: true })
+    }
     const toInbox = upload.parentId === INBOX
     if (toInbox) {
       const existing = db.prepare("SELECT id FROM nodes WHERE parent_id = ? AND blob_hash = ? AND deleted = 0 AND kind = 'file'").get(INBOX, actual) as any
@@ -695,6 +791,27 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (toInbox) broadcast("inbox", { name: upload.name, size: info.size })
     else broadcast("files", { nodeId })
     return sendJson(res, 200, { nodeId, hash: actual, size: info.size, instant: false })
+  }
+
+  const viewMatch = /^\/view\/([0-9a-f-]+)$/.exec(path)
+  if (viewMatch && method === "GET") {
+    const node = db.prepare("SELECT id, name, size, mtime FROM nodes WHERE id = ? AND deleted = 0 AND kind = 'file'").get(viewMatch[1]) as any
+    if (!node) return fail(res, 404, "not found")
+    const html = viewerPage(node)
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(html) })
+    res.end(html)
+    return
+  }
+
+  const versionsMatch = /^\/api\/nodes\/([0-9a-f-]+)\/versions$/.exec(path)
+  if (versionsMatch && method === "GET") {
+    const node = db.prepare("SELECT id, name, size, blob_hash FROM nodes WHERE id = ? AND deleted = 0").get(versionsMatch[1]) as any
+    if (!node) return fail(res, 404, "not found")
+    const rows = db.prepare("SELECT id, blob_hash, size, created_at FROM versions WHERE node_id = ? ORDER BY created_at DESC LIMIT 50").all(node.id) as any[]
+    return sendJson(res, 200, {
+      current: { size: node.size, hash: node.blob_hash },
+      items: rows.map((r) => ({ id: r.id, size: r.size, at: r.created_at })),
+    })
   }
 
   if (method === "GET" && path === "/api/pair-url") {
