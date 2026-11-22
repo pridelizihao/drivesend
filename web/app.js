@@ -140,6 +140,43 @@ if (pdfjs) pdfjs.GlobalWorkerOptions.workerSrc = "vendor/pdf.worker.min.js"
 
 const pdfDocs = new Map()     // nodeId -> Promise<PDFDocumentProxy>
 const pdfThumbs = new Map()   // nodeId -> data URL
+
+// Thumbnails cost a real render, so keep them across reloads and folder changes.
+// IndexedDB is used because localStorage would blow its ~5 MB budget quickly.
+const thumbStore = {
+  db: null,
+  open() {
+    if (this.db) return Promise.resolve(this.db)
+    if (!window.indexedDB) return Promise.resolve(null)
+    return new Promise((resolve) => {
+      const req = indexedDB.open("drivesend-thumbs", 1)
+      req.onupgradeneeded = () => {
+        const db = req.result
+        if (!db.objectStoreNames.contains("thumbs")) db.createObjectStore("thumbs")
+      }
+      req.onsuccess = () => { this.db = req.result; resolve(this.db) }
+      req.onerror = () => resolve(null)
+    })
+  },
+  async get(key) {
+    const db = await this.open()
+    if (!db) return null
+    return new Promise((resolve) => {
+      try {
+        const req = db.transaction("thumbs", "readonly").objectStore("thumbs").get(key)
+        req.onsuccess = () => resolve(req.result || null)
+        req.onerror = () => resolve(null)
+      } catch (err) { resolve(null) }
+    })
+  },
+  async set(key, value) {
+    const db = await this.open()
+    if (!db) return
+    try {
+      db.transaction("thumbs", "readwrite").objectStore("thumbs").put(value, key)
+    } catch (err) { /* quota or blocked: thumbnails are optional */ }
+  },
+}
 const pdfRenderQueue = []
 let pdfRenderActive = 0
 const PDF_RENDER_CONCURRENCY = 2
@@ -178,6 +215,11 @@ function pumpPdfQueue() {
 
 async function renderPdfThumb(id, item) {
   if (pdfThumbs.has(id)) return pdfThumbs.get(id)
+  const cached = await thumbStore.get(id)
+  if (cached && cached.mtime === item.mtime && cached.url) {
+    pdfThumbs.set(id, cached.url)
+    return cached.url
+  }
   const doc = await loadPdfDoc(id)
   const page = await doc.getPage(1)
   const base = page.getViewport({ scale: 1 })
@@ -193,6 +235,7 @@ async function renderPdfThumb(id, item) {
   await page.render({ canvasContext: ctx, viewport }).promise
   const url = canvas.toDataURL("image/png")
   pdfThumbs.set(id, url)
+  thumbStore.set(id, { url, mtime: item.mtime })
   return url
 }
 
@@ -207,6 +250,12 @@ function fileGlyph(item) {
       holder.replaceWith(el("div", { class: "icon", text: icon(item.name, item.kind) }))
     })
     holder.append(img)
+    // A known thumbnail paints immediately; only an uncached one goes through the queue.
+    const known = pdfThumbs.get(item.id)
+    if (known) {
+      img.src = known
+      return holder
+    }
     schedulePdfThumb(item.id, item).then((url) => {
       if (url) img.src = url
       else holder.replaceWith(el("div", { class: "icon", text: icon(item.name, item.kind) }))

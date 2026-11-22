@@ -226,18 +226,27 @@ function previewableType(type: string): boolean {
   return false
 }
 
-async function streamFile(req: IncomingMessage, res: ServerResponse, file: string, name: string, inline = false): Promise<void> {
+async function streamFile(req: IncomingMessage, res: ServerResponse, file: string, name: string, inline = false, version = ""): Promise<void> {
   const info = await stat(file)
   const type = MIME[extname(name).toLowerCase()] ?? "application/octet-stream"
+  // Content-addressed blobs never change for a given hash, so a revalidation is enough
+  // to make a repeat view free without risking a stale file after a version replace.
+  const etag = version ? '"' + version + '"' : ""
+  if (etag && req.headers["if-none-match"] === etag) {
+    res.writeHead(304, { etag, "cache-control": "private, no-cache" })
+    res.end()
+    return
+  }
   const range = req.headers.range
   const allowInline = inline && previewableType(type)
   const base: Record<string, string | number> = {
     "content-type": type,
     "accept-ranges": "bytes",
     "content-disposition": allowInline ? contentDisposition(name).replace(/^attachment/, "inline") : contentDisposition(name),
-    "cache-control": "private, max-age=0",
+    "cache-control": "private, no-cache",
     "x-content-type-options": "nosniff",
   }
+  if (etag) base.etag = etag
   if (allowInline && !type.startsWith("text/")) base["content-security-policy"] = "sandbox"
   if (range) {
     const match = /^bytes=(\d*)-(\d*)$/.exec(range)
@@ -359,7 +368,7 @@ function viewerPage(node: any): string {
     "body.dragging .drop-hint{display:grid}",
     "</style>",
     "<div class=\"bar\">",
-    "<a class=\"btn\" href=\"" + BASE + "/\">‹ 返回</a>",
+    "<button class=\"btn\" id=\"backBtn\">‹ 返回</button>",
     "<span class=\"name\">" + title + "</span>",
     "<span class=\"meta\">" + humanSize(node.size) + "</span>",
     "<span class=\"spacer\"></span>",
@@ -379,6 +388,10 @@ function viewerPage(node: any): string {
     "function toast(t){toastEl.textContent=t;toastEl.style.display='block';clearTimeout(window.__tt);window.__tt=setTimeout(()=>toastEl.style.display='none',4200)}",
     "const upBtn=document.getElementById('uploadBtn');",
     "const fileInput=document.getElementById('file');",
+    "document.getElementById('backBtn').addEventListener('click',()=>{",
+    "  window.close();",
+    "  setTimeout(()=>{ if(!window.closed) location.href=BASE+'/'; },120);",
+    "});",
     "upBtn.addEventListener('click',()=>{fileInput.click();});",
     "async function replaceWith(f){",
     "  if(!f) return;",
@@ -997,7 +1010,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       })
     }
     const inline = url.searchParams.get("inline") === "1"
-    return streamFile(req, res, file, row.name, inline)
+    return streamFile(req, res, file, row.name, inline, row.blob_hash)
   }
 
   if (method === "POST" && path === "/api/shares") {
