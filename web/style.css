@@ -440,6 +440,7 @@ body.dragging .drop { display: flex; }
   animation: fade-in 0.15s ease;
 }
 .modal {
+  position: relative;
   width: min(420px, 92vw);
   padding: 22px;
   border-radius: 20px;
@@ -450,7 +451,81 @@ body.dragging .drop { display: flex; }
   box-shadow: 0 24px 70px rgba(0, 0, 0, 0.2);
   animation: pop-in 0.18s cubic-bezier(0.2, 0.9, 0.3, 1.1);
 }
+.modal.preview { width: min(980px, 94vw); }
 .modal-title { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 14px; word-break: break-all; }
+
+.preview-stage {
+  display: grid;
+  place-items: center;
+  min-height: 220px;
+  max-height: 72vh;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.035);
+}
+.preview-stage.is-plain { background: transparent; }
+.preview-stage img,
+.preview-stage video {
+  max-width: 100%;
+  max-height: 70vh;
+  border-radius: 10px;
+  display: block;
+}
+.preview-stage iframe {
+  width: 100%;
+  height: 70vh;
+  border: 0;
+  border-radius: 10px;
+  background: #fff;
+}
+.preview-stage audio { width: 100%; }
+.preview-text {
+  margin: 0;
+  width: 100%;
+  max-height: 70vh;
+  overflow: auto;
+  text-align: left;
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--ink-2);
+}
+.preview-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  color: var(--ink-3);
+  font-size: 13px;
+  padding: 24px 0;
+}
+.preview-big { font-size: 44px; }
+.preview-meta { text-align: center; }
+.preview-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: var(--shadow-soft);
+  font-size: 20px;
+  line-height: 1;
+  color: var(--ink-2);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+.preview-nav:hover { color: var(--ink); background: #fff; }
+.preview-nav.prev { left: -52px; }
+.preview-nav.next { right: -52px; }
+@media (max-width: 1100px) {
+  .preview-nav.prev { left: 6px; }
+  .preview-nav.next { right: 6px; }
+}
 .modal-body { display: flex; flex-direction: column; gap: 11px; }
 .modal-text { color: var(--ink-2); font-size: 13px; line-height: 1.55; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }

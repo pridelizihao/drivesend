@@ -141,14 +141,18 @@ function openModal(titleText, render) {
   card.append(body)
   backdrop.append(card)
   document.body.append(backdrop)
+  const cleanups = []
   const onKey = (event) => { if (event.key === "Escape") close() }
   function close() {
+    for (const fn of cleanups) {
+      try { fn() } catch (err) { /* ignore */ }
+    }
     backdrop.remove()
     document.removeEventListener("keydown", onKey)
   }
   document.addEventListener("keydown", onKey)
   backdrop.addEventListener("mousedown", (event) => { if (event.target === backdrop) close() })
-  render(body, close)
+  render(body, close, card, { onClose: (fn) => cleanups.push(fn) })
   return close
 }
 
@@ -178,6 +182,101 @@ function confirmModal(titleText, message, onOk) {
       el("button", { class: "btn ghost", text: "取消", onclick: close }),
       el("button", { class: "btn danger", text: "删除", onclick: () => { close(); onOk() } }),
     ]))
+  })
+}
+
+const PREVIEW_LIMITS = { text: 512 * 1024 }
+
+function previewKind(name) {
+  const ext = (name.split(".").pop() || "").toLowerCase()
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif"].includes(ext)) return "image"
+  if (ext === "pdf") return "pdf"
+  if (["mp4", "webm", "mov", "m4v"].includes(ext)) return "video"
+  if (["mp3", "wav", "flac", "m4a", "ogg", "aac"].includes(ext)) return "audio"
+  if (["txt", "md", "json", "log", "csv", "js", "ts", "css", "html", "xml", "yml", "yaml", "ini", "sh"].includes(ext)) return "text"
+  return null
+}
+
+function openPreview(item, siblings) {
+  const files = (siblings || []).filter((entry) => entry.kind === "file")
+  let index = files.findIndex((entry) => entry.id === item.id)
+  if (index < 0) { files.unshift(item); index = 0 }
+
+  openModal(item.name, (body, close, modal, api) => {
+    modal.classList.add("preview")
+    const stage = el("div", { class: "preview-stage" })
+    const meta = el("div", { class: "hint preview-meta" })
+    const prev = el("button", { class: "preview-nav prev", text: "‹", title: "上一个" })
+    const next = el("button", { class: "preview-nav next", text: "›", title: "下一个" })
+
+    function show(i) {
+      index = (i + files.length) % files.length
+      const current = files[index]
+      const kind = previewKind(current.name)
+      stage.innerHTML = ""
+      stage.classList.toggle("is-plain", kind === null)
+      const url = "api/download/" + current.id + "?inline=1"
+      if (kind === "image") {
+        stage.append(el("img", { src: url, alt: current.name }))
+      } else if (kind === "pdf") {
+        stage.append(el("iframe", { src: url, title: current.name }))
+      } else if (kind === "video") {
+        const video = document.createElement("video")
+        video.src = url
+        video.controls = true
+        video.playsInline = true
+        stage.append(video)
+      } else if (kind === "audio") {
+        const audio = document.createElement("audio")
+        audio.src = url
+        audio.controls = true
+        stage.append(audio)
+      } else if (kind === "text") {
+        if (current.size > PREVIEW_LIMITS.text) {
+          stage.append(el("div", { class: "preview-empty" }, [
+            el("div", { class: "preview-big", text: "📄" }),
+            el("div", { text: "文件太大，暂不预览（" + humanSize(current.size) + "）" }),
+          ]))
+        } else {
+          const pre = el("pre", { class: "preview-text", text: "加载中…" })
+          stage.append(pre)
+          fetch(url)
+            .then((res) => res.text())
+            .then((text) => { pre.textContent = text.slice(0, PREVIEW_LIMITS.text) })
+            .catch(() => { pre.textContent = "加载失败" })
+        }
+      } else {
+        stage.append(el("div", { class: "preview-empty" }, [
+          el("div", { class: "preview-big", text: icon(current.name) }),
+          el("div", { text: "这种格式不支持预览" }),
+          el("button", {
+            class: "btn small", text: "下载",
+            onclick: () => { window.location.href = "api/download/" + current.id },
+          }),
+        ]))
+      }
+      meta.textContent = (index + 1) + " / " + files.length + " · " + humanSize(current.size)
+      modal.querySelector(".modal-title").textContent = current.name
+      const multiple = files.length > 1
+      prev.hidden = !multiple
+      next.hidden = !multiple
+    }
+
+    prev.addEventListener("click", () => show(index - 1))
+    next.addEventListener("click", () => show(index + 1))
+    const onKey = (event) => {
+      if (event.key === "ArrowLeft") { event.preventDefault(); show(index - 1) }
+      if (event.key === "ArrowRight") { event.preventDefault(); show(index + 1) }
+    }
+    document.addEventListener("keydown", onKey)
+    api.onClose(() => document.removeEventListener("keydown", onKey))
+
+    body.append(stage, meta, el("div", { class: "modal-actions" }, [
+      el("button", { class: "btn ghost", text: "下载", onclick: () => { window.location.href = "api/download/" + files[index].id } }),
+      el("button", { class: "btn", text: "关闭", onclick: close }),
+    ]))
+    body.append(prev, next)
+    show(index)
   })
 }
 
@@ -539,7 +638,10 @@ async function loadSearch(query) {
       el("div", {
         class: "name" + (isFolder ? " folder" : ""),
         text: item.name,
-        onclick: () => { $("#searchInput").value = ""; exitSearch(); isFolder ? loadFiles(item.id) : loadFiles(item.parentId) },
+        onclick: () => {
+        if (isFolder) { $("#searchInput").value = ""; exitSearch(); loadFiles(item.id) }
+        else openPreview(item, data.items)
+      },
       }),
       el("div", { class: "size", text: isFolder ? "—" : humanSize(item.size) }),
       el("div", { class: "time", text: item.path || "根目录" }),
@@ -618,7 +720,7 @@ function renderFiles() {
         text: item.name,
         onclick: () => {
           if (isFolder) loadFiles(item.id)
-          else selectRow(item, row)
+          else openPreview(item, state.items)
         },
       }),
       el("div", { class: "size", text: isFolder ? "—" : humanSize(item.size) }),

@@ -44,6 +44,7 @@
 | 文件管理 | 目录树、新建文件夹、重命名、拖拽移动、多选批量操作 |
 | 回收站 | 删除先进回收站，30 天后自动清除，可随时恢复或彻底删除 |
 | 搜索 | 按文件名搜索全盘，结果带所在路径 |
+| 在线预览 | 图片、PDF、视频、音频、文本直接在页面内打开，可左右切换同目录文件 |
 | 手机配对 | 传输站内生成二维码，扫码直接登录，无需输入令牌 |
 | 存储统计 | 区分「逻辑占用」与「实际占用」，直观看到去重省了多少 |
 
@@ -127,6 +128,7 @@ POST   /api/upload/init            秒传判定 / 开启上传会话
 PUT    /api/upload/:id?offset=     写入一个分块（原始字节）
 POST   /api/upload/:id/complete    校验哈希 → 落 CAS → 建节点
 GET    /api/download/:id           下载，支持 Range
+GET    /api/download/:id?inline=1  预览：仅图片/PDF/音视频/文本内联，SVG 与 HTML 强制下载
 GET    /api/download/:id?burn=1    下载完成后立即删除（传输站领取）
 
 GET    /api/files?parent=          列目录 + 面包屑
@@ -202,6 +204,8 @@ location /drive/ {
 - **分享链接不需要令牌**——这是分享的语义。令牌为 96 位随机串，无法猜测，但链接一旦转发即等同放行。
 - 传输站文件默认 24 小时过期，领取即可删除。
 - 当前无内置 TLS。公网部署请在前面加一层 HTTPS，否则令牌与文件内容均为明文传输。
+- 预览接口按扩展名白名单判定：图片（SVG 除外）、PDF、音视频、纯文本可以内联渲染，
+  SVG 与 HTML 一律降级为下载。否则用户上传的 HTML 会和主应用同源，能读取会话 Cookie。
 
 ## 设计取舍
 
@@ -224,6 +228,7 @@ node test/move.mjs       # 移动与防环规则（9 项断言）
 node test/inbox.mjs      # 传输站流程（10 项断言）
 node test/trash.mjs      # 回收站、恢复、搜索（16 项断言）
 node test/delete.mjs     # 删除语义与空间回收（9 项断言）
+node test/preview.mjs    # 预览内联白名单与安全头
 node test/sha256.mjs     # 纯 JS SHA-256 与原生实现比对
 ```
 
@@ -240,6 +245,7 @@ BASE=https://drive.example.com/drive DS_AUTH=<token> node test/smoke.mjs
 - [x] 传输站（TTL、实时推送、领取即删）
 - [x] 分享链接、移动、重命名、二维码配对
 - [x] 回收站、全盘搜索、多选批量操作
+- [x] 在线预览（图片 / PDF / 音视频 / 文本）
 - [ ] 局域网直连（mDNS 发现 + 不经服务器的直传）
 - [ ] 块级去重与增量同步
 - [ ] 回收站

@@ -208,23 +208,41 @@ function contentDisposition(name: string): string {
   return "attachment; filename=\"" + ascii + "\"; filename*=UTF-8''" + encodeURIComponent(name)
 }
 
-async function streamFile(req: IncomingMessage, res: ServerResponse, file: string, name: string): Promise<void> {
+/**
+ * Types we are willing to render inline (in the same origin as the app).
+ * SVG and HTML are excluded on purpose: they can execute script and would get
+ * access to the session cookie. Everything else falls back to a download.
+ */
+function previewableType(type: string): boolean {
+  if (type.startsWith("image/")) return !type.includes("svg")
+  if (type === "application/pdf") return true
+  if (type.startsWith("video/")) return true
+  if (type.startsWith("audio/")) return true
+  if (type === "application/json; charset=utf-8") return true
+  if (type.startsWith("text/") && !type.includes("html")) return true
+  return false
+}
+
+async function streamFile(req: IncomingMessage, res: ServerResponse, file: string, name: string, inline = false): Promise<void> {
   const info = await stat(file)
   const type = MIME[extname(name).toLowerCase()] ?? "application/octet-stream"
   const range = req.headers.range
-  const base = {
+  const allowInline = inline && previewableType(type)
+  const base: Record<string, string | number> = {
     "content-type": type,
     "accept-ranges": "bytes",
-    "content-disposition": contentDisposition(name),
+    "content-disposition": allowInline ? contentDisposition(name).replace(/^attachment/, "inline") : contentDisposition(name),
     "cache-control": "private, max-age=0",
+    "x-content-type-options": "nosniff",
   }
+  if (allowInline && !type.startsWith("text/")) base["content-security-policy"] = "sandbox"
   if (range) {
     const match = /^bytes=(\d*)-(\d*)$/.exec(range)
     if (match) {
       const start = match[1] ? Number(match[1]) : 0
       const end = match[2] ? Math.min(Number(match[2]), info.size - 1) : info.size - 1
       if (start <= end && start < info.size) {
-        res.writeHead(206, { ...base, "content-range": "bytes " + start + "-" + end + "/" + info.size, "content-length": end - start + 1 })
+        res.writeHead(206, { ...base, "content-range": "bytes " + start + "-" + end + "/" + info.size, "content-length": end - start + 1 } as any)
         createReadStream(file, { start, end }).pipe(res)
         return
       }
@@ -233,7 +251,7 @@ async function streamFile(req: IncomingMessage, res: ServerResponse, file: strin
     res.end()
     return
   }
-  res.writeHead(200, { ...base, "content-length": info.size })
+  res.writeHead(200, { ...base, "content-length": info.size } as any)
   createReadStream(file).pipe(res)
 }
 
@@ -666,7 +684,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         broadcast("files", { deleted: row.id })
       })
     }
-    return streamFile(req, res, file, row.name)
+    const inline = url.searchParams.get("inline") === "1"
+    return streamFile(req, res, file, row.name, inline)
   }
 
   if (method === "POST" && path === "/api/shares") {

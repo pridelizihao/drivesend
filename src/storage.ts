@@ -50,6 +50,12 @@ export const MIME: Record<string, string> = {
   ".txt": "text/plain; charset=utf-8",
   ".md": "text/markdown; charset=utf-8",
   ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".mov": "video/quicktime",
   ".mp3": "audio/mpeg",
+  ".m4a": "audio/mp4",
+  ".wav": "audio/wav",
+  ".csv": "text/csv; charset=utf-8",
+  ".log": "text/plain; charset=utf-8",
   ".zip": "application/zip",
 }
