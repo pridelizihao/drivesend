@@ -18,6 +18,8 @@ const CHUNK = 4 * 1024 * 1024
 const INBOX = "inbox"
 const INBOX_TTL_H = Number(process.env.INBOX_TTL_H ?? 24)
 const INBOX_TTL = INBOX_TTL_H * 3600 * 1000
+const TRASH_TTL_H = Number(process.env.TRASH_TTL_H ?? 720)
+const TRASH_TTL = TRASH_TTL_H * 3600 * 1000
 const TOKEN = process.env.DS_TOKEN ?? ""
 const RAW_BASE = process.env.BASE_PATH ?? ""
 const BASE = RAW_BASE.endsWith("/") ? RAW_BASE.slice(0, RAW_BASE.length - 1) : RAW_BASE
@@ -117,23 +119,69 @@ function createFileNode(name: string, parentId: string | null, size: number, has
   return id
 }
 
+/** Soft delete: the subtree moves to the trash, content is retained. */
 function deleteTree(id: string): void {
-  const self = db.prepare("SELECT kind FROM nodes WHERE id = ? AND deleted = 0").get(id) as any
-  if (self && self.kind === "file") releaseBlob(id)
-  const children = db.prepare("SELECT id, kind FROM nodes WHERE parent_id = ? AND deleted = 0").all(id) as any[]
-  for (const child of children) {
-    if (child.kind === "folder") deleteTree(child.id)
-    else releaseBlob(child.id)
+  const now = Date.now()
+  const stack: string[] = [id]
+  const touched: string[] = []
+  let guard = 0
+  while (stack.length > 0 && guard++ < 100000) {
+    const current = stack.pop() as string
+    db.prepare("UPDATE nodes SET deleted = 1, deleted_at = ? WHERE id = ? AND deleted = 0").run(now, current)
+    touched.push(current)
+    const children = db.prepare("SELECT id FROM nodes WHERE parent_id = ? AND deleted = 0").all(current) as any[]
+    for (const child of children) stack.push(child.id)
   }
-  db.prepare("UPDATE nodes SET deleted = 1 WHERE id = ?").run(id)
+  for (const nodeId of touched) db.prepare("DELETE FROM shares WHERE node_id = ?").run(nodeId)
 }
 
-function releaseBlob(id: string): void {
-  const row = db.prepare("SELECT blob_hash FROM nodes WHERE id = ?").get(id) as any
-  if (row && row.blob_hash) {
-    db.prepare("UPDATE blobs SET refs = refs - 1 WHERE hash = ?").run(row.blob_hash)
+/** Hard delete: rows disappear and blob references are dropped. Used by purge and by 传输站 burn. */
+function purgeTree(id: string): string[] {
+  const hashes: string[] = []
+  const stack: string[] = [id]
+  let guard = 0
+  while (stack.length > 0 && guard++ < 100000) {
+    const current = stack.pop() as string
+    const children = db.prepare("SELECT id FROM nodes WHERE parent_id = ?").all(current) as any[]
+    for (const child of children) stack.push(child.id)
+    const row = db.prepare("SELECT blob_hash FROM nodes WHERE id = ?").get(current) as any
+    if (row && row.blob_hash) hashes.push(row.blob_hash)
+    db.prepare("DELETE FROM shares WHERE node_id = ?").run(current)
+    db.prepare("DELETE FROM nodes WHERE id = ?").run(current)
   }
-  db.prepare("DELETE FROM shares WHERE node_id = ?").run(id)
+  for (const hash of hashes) {
+    db.prepare("UPDATE blobs SET refs = refs - 1 WHERE hash = ?").run(hash)
+  }
+  return hashes
+}
+
+async function collectGarbage(hashes: string[] | null): Promise<void> {
+  try {
+    const rows = hashes
+      ? hashes.map((hash) => ({ hash }))
+      : (db.prepare("SELECT hash FROM blobs WHERE refs <= 0 AND created_at < ?").all(Date.now() - 3600 * 1000) as any[])
+    for (const row of rows) {
+      const live = db.prepare("SELECT refs FROM blobs WHERE hash = ?").get(row.hash) as any
+      if (live && live.refs > 0) continue
+      await removeQuiet(blobPath(BLOBS, row.hash))
+      db.prepare("DELETE FROM blobs WHERE hash = ?").run(row.hash)
+    }
+  } catch (err: any) {
+    console.error("[gc]", err?.message)
+  }
+}
+
+function subtreeIds(id: string): string[] {
+  const out: string[] = []
+  const stack: string[] = [id]
+  let guard = 0
+  while (stack.length > 0 && guard++ < 100000) {
+    const current = stack.pop() as string
+    out.push(current)
+    const children = db.prepare("SELECT id FROM nodes WHERE parent_id = ?").all(current) as any[]
+    for (const child of children) stack.push(child.id)
+  }
+  return out
 }
 
 function subscribe(req: IncomingMessage, res: ServerResponse): void {
@@ -255,7 +303,9 @@ function stats() {
   const logical = (db.prepare("SELECT COALESCE(SUM(size),0) AS s FROM nodes WHERE deleted = 0 AND kind = 'file'").get() as any).s as number
   const files = (db.prepare("SELECT COUNT(*) AS c FROM nodes WHERE deleted = 0 AND kind = 'file'").get() as any).c as number
   const blobs = (db.prepare("SELECT COUNT(*) AS c FROM blobs WHERE refs > 0").get() as any).c as number
-  return { physicalBytes: physical, logicalBytes: logical, files, blobs, savedBytes: Math.max(0, logical - physical) }
+  const trashBytes = (db.prepare("SELECT COALESCE(SUM(size),0) AS s FROM nodes WHERE deleted = 1 AND kind = 'file'").get() as any).s as number
+  const trashFiles = (db.prepare("SELECT COUNT(*) AS c FROM nodes WHERE deleted = 1 AND kind = 'file'").get() as any).c as number
+  return { physicalBytes: physical, logicalBytes: logical, files, blobs, trashBytes, trashFiles, savedBytes: Math.max(0, logical - physical) }
 }
 
 function inboxSummary() {
@@ -510,11 +560,89 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
   const deleteMatch = /^\/api\/nodes\/([0-9a-f-]+)$/.exec(path)
   if (deleteMatch && method === "DELETE") {
+    if (deleteMatch[1] === INBOX) return fail(res, 400, "不能删除传输站")
+    if (url.searchParams.get("purge") === "1") {
+      const node = db.prepare("SELECT id FROM nodes WHERE id = ?").get(deleteMatch[1]) as any
+      if (!node) return fail(res, 404, "not found")
+      const hashes = purgeTree(node.id)
+      await collectGarbage(hashes)
+      broadcast("files", { deleted: node.id })
+      return sendJson(res, 200, { ok: true, purged: true })
+    }
     const node = db.prepare("SELECT 1 FROM nodes WHERE id = ? AND deleted = 0").get(deleteMatch[1])
     if (!node) return fail(res, 404, "not found")
     deleteTree(deleteMatch[1])
     broadcast("files", { deleted: deleteMatch[1] })
     return sendJson(res, 200, { ok: true })
+  }
+
+  const restoreMatch = /^\/api\/nodes\/([0-9a-f-]+)\/restore$/.exec(path)
+  if (restoreMatch && method === "POST") {
+    const node = db.prepare("SELECT id, name, parent_id, deleted FROM nodes WHERE id = ?").get(restoreMatch[1]) as any
+    if (!node) return fail(res, 404, "not found")
+    if (node.id === INBOX) return fail(res, 400, "传输站不能恢复")
+    let parent = node.parent_id ?? null
+    if (parent) {
+      const row = db.prepare("SELECT id, deleted FROM nodes WHERE id = ?").get(parent) as any
+      if (!row || row.deleted === 1) parent = null
+    }
+    const name = uniqueName(parent, node.name)
+    const ids = subtreeIds(node.id)
+    const stamp = Date.now()
+    for (const id of ids) {
+      db.prepare("UPDATE nodes SET deleted = 0, deleted_at = NULL WHERE id = ?").run(id)
+    }
+    db.prepare("UPDATE nodes SET parent_id = ?, name = ?, mtime = ? WHERE id = ?").run(parent, name, stamp, node.id)
+    broadcast("files", { restored: node.id })
+    return sendJson(res, 200, { ok: true, name, movedToRoot: (node.parent_id ?? null) !== parent })
+  }
+
+  if (method === "GET" && path === "/api/trash") {
+    const rows = db.prepare(
+      "SELECT n.id, n.name, n.kind, n.size, n.deleted_at, n.parent_id FROM nodes n WHERE n.deleted = 1 AND n.id <> ? " +
+      "AND (n.parent_id IS NULL OR NOT EXISTS (SELECT 1 FROM nodes p WHERE p.id = n.parent_id AND p.deleted = 1)) " +
+      "ORDER BY n.deleted_at DESC LIMIT 200"
+    ).all(INBOX) as any[]
+    const now = Date.now()
+    return sendJson(res, 200, {
+      items: rows.map((r) => ({ id: r.id, name: r.name, kind: r.kind, size: r.size, deletedAt: r.deleted_at, purgeAt: r.deleted_at + TRASH_TTL })),
+      purgeInDays: Math.round(TRASH_TTL / 86400000),
+      now,
+    })
+  }
+
+  if (method === "DELETE" && path === "/api/trash") {
+    const rows = db.prepare(
+      "SELECT n.id FROM nodes n WHERE n.deleted = 1 AND n.id <> ? " +
+      "AND (n.parent_id IS NULL OR NOT EXISTS (SELECT 1 FROM nodes p WHERE p.id = n.parent_id AND p.deleted = 1))"
+    ).all(INBOX) as any[]
+    const hashes: string[] = []
+    for (const row of rows) hashes.push(...purgeTree(row.id))
+    await collectGarbage(hashes)
+    broadcast("files", { emptied: true })
+    return sendJson(res, 200, { ok: true, removed: rows.length })
+  }
+
+  if (method === "GET" && path === "/api/search") {
+    const raw = (url.searchParams.get("q") ?? "").trim()
+    if (!raw) return sendJson(res, 200, { items: [], query: "" })
+    const like = "%" + raw.replace(/[\\%_]/g, (ch) => "\\" + ch) + "%"
+    const rows = db.prepare(
+      "SELECT id, name, kind, size, parent_id, mtime FROM nodes WHERE deleted = 0 AND id <> ? AND name LIKE ? ESCAPE '\\' ORDER BY mtime DESC LIMIT 100"
+    ).all(INBOX, like) as any[]
+    const items = rows.map((r) => {
+      const path: string[] = []
+      let cur = r.parent_id
+      let guard = 0
+      while (cur && guard++ < 64) {
+        const row = db.prepare("SELECT id, name, parent_id FROM nodes WHERE id = ?").get(cur) as any
+        if (!row) break
+        path.unshift(row.name)
+        cur = row.parent_id
+      }
+      return { id: r.id, name: r.name, kind: r.kind, size: r.size, parentId: r.parent_id, mtime: r.mtime, path: path.join(" / ") }
+    })
+    return sendJson(res, 200, { items, query: raw })
   }
 
   if (method === "GET" && path === "/api/inbox") {
@@ -533,7 +661,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (!(await fileExists(file))) return fail(res, 410, "blob missing")
     if (url.searchParams.get("burn") === "1") {
       res.on("finish", () => {
-        deleteTree(row.id)
+        const hashes = purgeTree(row.id)
+        collectGarbage(hashes)
         broadcast("files", { deleted: row.id })
       })
     }
@@ -611,18 +740,16 @@ const server = http.createServer((req, res) => {
 setInterval(async () => {
   for (const res of subs) res.write(": ping\n\n")
   const now = Date.now()
-  try {
-    const orphans = db.prepare("SELECT hash FROM blobs WHERE refs <= 0 AND created_at < ?").all(now - 3600 * 1000) as any[]
-    for (const row of orphans) {
-      await removeQuiet(blobPath(BLOBS, row.hash))
-      db.prepare("DELETE FROM blobs WHERE hash = ?").run(row.hash)
-    }
-  } catch (err: any) {
-    console.error("[gc]", err?.message)
-  }
+  await collectGarbage(null)
   db.prepare("DELETE FROM shares WHERE expires_at IS NOT NULL AND expires_at < ?").run(now)
   const expired = db.prepare("SELECT id FROM nodes WHERE expires_at IS NOT NULL AND expires_at < ? AND deleted = 0").all(now) as any[]
-  for (const row of expired) deleteTree(row.id)
+  const expiredHashes: string[] = []
+  for (const row of expired) expiredHashes.push(...purgeTree(row.id))
+  if (expiredHashes.length > 0) await collectGarbage(expiredHashes)
+  const stale = db.prepare("SELECT id FROM nodes WHERE deleted = 1 AND deleted_at IS NOT NULL AND deleted_at < ? AND id <> ?").all(now - TRASH_TTL, INBOX) as any[]
+  const staleHashes: string[] = []
+  for (const row of stale) staleHashes.push(...purgeTree(row.id))
+  if (staleHashes.length > 0) await collectGarbage(staleHashes)
 }, 30000).unref()
 
 server.listen(PORT, HOST, () => {

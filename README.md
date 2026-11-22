@@ -41,7 +41,9 @@
 | 断点下载 | 标准 HTTP Range（206），大文件可续传 |
 | 传输站 | 手机上传 → 其他设备实时弹通知 → 「保存」或「保存并删除」 |
 | 分享链接 | 1 小时 / 24 小时 / 7 天 / 永久，独立落地页，可撤销 |
-| 文件管理 | 目录树、新建文件夹、重命名、拖拽移动、软删除 |
+| 文件管理 | 目录树、新建文件夹、重命名、拖拽移动、多选批量操作 |
+| 回收站 | 删除先进回收站，30 天后自动清除，可随时恢复或彻底删除 |
+| 搜索 | 按文件名搜索全盘，结果带所在路径 |
 | 手机配对 | 传输站内生成二维码，扫码直接登录，无需输入令牌 |
 | 存储统计 | 区分「逻辑占用」与「实际占用」，直观看到去重省了多少 |
 
@@ -69,6 +71,7 @@ node src/server.ts
 | `DS_TOKEN` | 空 | 访问令牌。公网部署必须设置，留空即无鉴权 |
 | `BASE_PATH` | 空 | 子路径部署前缀，如 `/drive` |
 | `INBOX_TTL_H` | `24` | 传输站文件存活小时数 |
+| `TRASH_TTL_H` | `720` | 回收站保留小时数（默认 30 天） |
 
 ## 架构
 
@@ -130,7 +133,12 @@ GET    /api/files?parent=          列目录 + 面包屑
 POST   /api/folders                新建文件夹
 POST   /api/nodes/:id/rename       重命名
 POST   /api/nodes/:id/move         移动（防环、重名自动加序号）
-DELETE /api/nodes/:id              递归软删除
+DELETE /api/nodes/:id              删除，进入回收站
+DELETE /api/nodes/:id?purge=1      永久删除（不经过回收站）
+POST   /api/nodes/:id/restore      从回收站恢复
+GET    /api/trash                  回收站列表
+DELETE /api/trash                  清空回收站
+GET    /api/search?q=              按文件名搜索
 
 GET    /api/inbox                  传输站列表
 POST   /api/shares                 创建分享链接
@@ -212,8 +220,10 @@ location /drive/ {
 
 ```bash
 node test/smoke.mjs      # 网盘主流程（19 项断言）
-node test/inbox.mjs      # 传输站流程（10 项断言）
 node test/move.mjs       # 移动与防环规则（9 项断言）
+node test/inbox.mjs      # 传输站流程（10 项断言）
+node test/trash.mjs      # 回收站、恢复、搜索（16 项断言）
+node test/delete.mjs     # 删除语义与空间回收（9 项断言）
 node test/sha256.mjs     # 纯 JS SHA-256 与原生实现比对
 ```
 
@@ -229,6 +239,7 @@ BASE=https://drive.example.com/drive DS_AUTH=<token> node test/smoke.mjs
 - [x] 分块上传、秒传、Range 下载
 - [x] 传输站（TTL、实时推送、领取即删）
 - [x] 分享链接、移动、重命名、二维码配对
+- [x] 回收站、全盘搜索、多选批量操作
 - [ ] 局域网直连（mDNS 发现 + 不经服务器的直传）
 - [ ] 块级去重与增量同步
 - [ ] 回收站

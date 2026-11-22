@@ -22,5 +22,8 @@ export function openDb(file: string): Db {
   if (!cols.some((col) => col.name === "expires_at")) {
     db.exec("ALTER TABLE nodes ADD COLUMN expires_at INTEGER")
   }
+  if (!cols.some((col) => col.name === "deleted_at")) {
+    db.exec("ALTER TABLE nodes ADD COLUMN deleted_at INTEGER")
+  }
   return db
 }

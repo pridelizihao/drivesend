@@ -8,7 +8,10 @@ const state = {
   breadcrumb: [],
   items: [],
   inbox: [],
+  trash: [],
   selected: null,
+  selection: new Set(),
+  searching: false,
 }
 
 const deviceLabel = (() => {
@@ -86,6 +89,7 @@ const ICON_PATHS = {
   trash: "M4.5 7h15M9.5 7V5.2A1.2 1.2 0 0110.7 4h2.6a1.2 1.2 0 011.2 1.2V7M6.5 7l.9 12.1A1.2 1.2 0 008.6 20h6.8a1.2 1.2 0 001.2-1.1L17.5 7",
   move: "M3.2 7.2a1.8 1.8 0 011.8-1.8h3.6l1.8 1.8h8.4a1.8 1.8 0 011.8 1.8v7.2a1.8 1.8 0 01-1.8 1.8H5a1.8 1.8 0 01-1.8-1.8V7.2zM12 10.6v4.6m0 0l-2-2m2 2l2-2",
   rename: "M4 20h4.2L19 9.2a2.1 2.1 0 00-3-3L5.2 17 4 20zM14.5 7.5l3 3",
+  restore: "M4 12a8 8 0 108-8M4 12V6m0 6h6",
 }
 
 function opBtn(kind, title, onclick, variant) {
@@ -324,14 +328,30 @@ async function openPair() {
 }
 
 function openMove(item, currentParent) {
-  openModal("移动「" + item.name + "」", (body, close) => {
+  openMoveFor([item.id], item.name, currentParent, () => loadFiles(state.parent))
+}
+
+function openMoveFor(ids, displayName, currentParent, onDone) {
+  const blocked = new Set(ids)
+  openModal("移动「" + displayName + "」" + (ids.length > 1 ? " 等 " + ids.length + " 项" : ""), (body, close) => {
     let target = currentParent
     const crumbs = el("div", { class: "crumbs" })
     const picker = el("div", { class: "picker" })
     const confirm = el("button", { class: "btn", text: "移到这里" })
     confirm.addEventListener("click", async () => {
       close()
-      await moveNode(item.id, target, item.name)
+      let moved = 0
+      for (const id of ids) {
+        try {
+          await post("api/nodes/" + id + "/move", { parentId: target })
+          moved++
+        } catch (err) {
+          toast(err.message, true)
+        }
+      }
+      if (moved > 0) toast("已移动 " + moved + " 项")
+      if (onDone) onDone()
+      else loadFiles(state.parent)
     })
     async function render() {
       let data
@@ -348,7 +368,7 @@ function openMove(item, currentParent) {
         crumbs.append(el("button", { text: crumb.name, onclick: () => { target = crumb.id; render() } }))
       }
       picker.innerHTML = ""
-      const folders = data.items.filter((entry) => entry.kind === "folder" && entry.id !== item.id)
+      const folders = data.items.filter((entry) => entry.kind === "folder" && !blocked.has(entry.id))
       if (!folders.length) picker.append(el("div", { class: "hint", text: "这里没有子文件夹" }))
       for (const folder of folders) {
         picker.append(el("button", {
@@ -367,16 +387,189 @@ function openMove(item, currentParent) {
   })
 }
 
+function updateBatchBar() {
+  const bar = $("#batchBar")
+  const count = state.selection.size
+  bar.hidden = count === 0
+  $("#batchCount").textContent = "已选 " + count + " 项"
+  for (const row of document.querySelectorAll(".row")) {
+    const box = row.querySelector(".pick")
+    if (box) box.checked = state.selection.has(row.dataset.id)
+    row.classList.toggle("is-selected", state.selection.has(row.dataset.id))
+  }
+}
+
+function clearSelection() {
+  state.selection.clear()
+  updateBatchBar()
+}
+
+function makeCheckbox(item) {
+  const wrap = el("label", { class: "pick-wrap" })
+  const box = el("input", { type: "checkbox", class: "pick" })
+  box.addEventListener("change", () => {
+    if (box.checked) state.selection.add(item.id)
+    else state.selection.delete(item.id)
+    updateBatchBar()
+  })
+  wrap.append(box)
+  return wrap
+}
+
+async function batchDelete() {
+  const ids = Array.from(state.selection)
+  if (!ids.length) return
+  confirmModal("删除 " + ids.length + " 项", "这些内容会进入回收站，可以恢复。", async () => {
+    let ok = 0
+    for (const id of ids) {
+      try { await api("api/nodes/" + id, { method: "DELETE" }); ok++ } catch (err) { /* keep going */ }
+    }
+    clearSelection()
+    toast("已移入回收站 " + ok + " 项")
+    loadFiles(state.parent)
+    refreshState()
+  })
+}
+
+async function batchMove() {
+  const ids = Array.from(state.selection)
+  if (!ids.length) return
+  const first = state.items.find((i) => i.id === ids[0]) || { id: ids[0], name: ids.length + " 项" }
+  openMoveFor(ids, first.name, state.parent, () => {
+    clearSelection()
+    loadFiles(state.parent)
+  })
+}
+
+async function loadTrash() {
+  const renderId = ++trashRenderId
+  let data
+  try {
+    data = await api("api/trash")
+  } catch (err) {
+    toast(err.message, true)
+    return
+  }
+  if (renderId !== trashRenderId) return
+  const box = $("#crumbs")
+  box.innerHTML = ""
+  box.append(el("span", { text: "回收站" }))
+  const list = $("#list")
+  list.innerHTML = ""
+  state.trash = data.items
+  if (!data.items.length) {
+    list.append(el("div", { class: "empty", text: "回收站是空的。" }))
+    return
+  }
+  for (const item of data.items) {
+    const row = el("div", { class: "row" }, [
+      el("div", { class: "icon", text: icon(item.name, item.kind) }),
+      el("div", { class: "name", text: item.name }),
+      el("div", { class: "size", text: item.kind === "folder" ? "—" : humanSize(item.size) }),
+      el("div", { class: "time", text: ago(item.deletedAt) + "删除" }),
+      el("div", { class: "ops" }),
+    ])
+    const ops = row.querySelector(".ops")
+    ops.append(opBtn("restore", "恢复", () => restoreNode(item)))
+    ops.append(opBtn("trash", "彻底删除", () => purgeNode(item), "danger"))
+    list.append(row)
+  }
+  list.append(el("div", { class: "trash-foot" }, [
+    el("span", { class: "hint", text: "回收站中的内容保留 " + data.purgeInDays + " 天后自动清除" }),
+    el("button", {
+      class: "btn ghost small danger-text", text: "清空回收站",
+      onclick: () => confirmModal("清空回收站", "所有内容将被永久删除，无法恢复。", async () => {
+        try {
+          const res = await api("api/trash", { method: "DELETE" })
+          toast("已永久删除 " + res.removed + " 项")
+          loadTrash()
+          refreshState()
+        } catch (err) { toast(err.message, true) }
+      }),
+    }),
+  ]))
+}
+
+async function restoreNode(item) {
+  try {
+    const res = await post("api/nodes/" + item.id + "/restore", {})
+    toast(res.movedToRoot ? "已恢复到根目录（原位置已不存在）" : "已恢复")
+    loadTrash()
+    refreshState()
+  } catch (err) {
+    toast(err.message, true)
+  }
+}
+
+async function purgeNode(item) {
+  confirmModal("彻底删除", "「" + item.name + "」将被永久删除，无法恢复。", async () => {
+    try {
+      await api("api/nodes/" + item.id + "?purge=1", { method: "DELETE" })
+      loadTrash()
+      refreshState()
+    } catch (err) { toast(err.message, true) }
+  })
+}
+
+let trashRenderId = 0
+let searchRenderId = 0
+async function loadSearch(query) {
+  const renderId = ++searchRenderId
+  let data
+  try {
+    data = await api("api/search?q=" + encodeURIComponent(query))
+  } catch (err) {
+    toast(err.message, true)
+    return
+  }
+  if (renderId !== searchRenderId) return
+  const box = $("#crumbs")
+  box.innerHTML = ""
+  box.append(el("span", { text: "搜索「" + data.query + "」 · " + data.items.length + " 个结果" }))
+  const list = $("#list")
+  list.innerHTML = ""
+  if (!data.items.length) {
+    list.append(el("div", { class: "empty", text: "没有找到匹配的文件。" }))
+    return
+  }
+  for (const item of data.items) {
+    const isFolder = item.kind === "folder"
+    const row = el("div", { class: "row" }, [
+      el("div", { class: "icon", text: icon(item.name, item.kind) }),
+      el("div", {
+        class: "name" + (isFolder ? " folder" : ""),
+        text: item.name,
+        onclick: () => { $("#searchInput").value = ""; exitSearch(); isFolder ? loadFiles(item.id) : loadFiles(item.parentId) },
+      }),
+      el("div", { class: "size", text: isFolder ? "—" : humanSize(item.size) }),
+      el("div", { class: "time", text: item.path || "根目录" }),
+      el("div", { class: "ops" }),
+    ])
+    const ops = row.querySelector(".ops")
+    if (!isFolder) ops.append(opBtn("download", "下载", () => { window.location.href = "api/download/" + item.id }))
+    ops.append(opBtn("move", "所在位置", () => { $("#searchInput").value = ""; exitSearch(); loadFiles(item.parentId) }))
+    list.append(row)
+  }
+}
+
+function exitSearch() {
+  state.searching = false
+  $("#searchInput").blur()
+}
+
 function setView(view) {
   state.view = view
   for (const btn of document.querySelectorAll(".nav-item")) {
     btn.classList.toggle("is-active", btn.dataset.view === view)
   }
-  $("#newFolder").style.display = view === "inbox" ? "none" : ""
+  $("#newFolder").style.display = view === "inbox" || view === "trash" || view === "shares" ? "none" : ""
   $("#qrBtn").hidden = view !== "inbox"
+  $("#pick").style.display = view === "trash" || view === "shares" ? "none" : ""
+  clearSelection()
   if (view === "files") loadFiles(state.parent)
   if (view === "inbox") loadInbox()
   if (view === "shares") loadShares()
+  if (view === "trash") loadTrash()
 }
 
 let filesRenderId = 0
@@ -389,8 +582,10 @@ async function loadFiles(parent) {
     state.breadcrumb = data.breadcrumb
     state.items = data.items
     state.selected = null
+    state.searching = false
     renderCrumbs()
     renderFiles()
+    updateBatchBar()
   } catch (err) {
     toast(err.message, true)
   }
@@ -415,7 +610,8 @@ function renderFiles() {
   }
   for (const item of state.items) {
     const isFolder = item.kind === "folder"
-    const row = el("div", { class: "row" }, [
+    const row = el("div", { class: "row", "data-id": item.id }, [
+      makeCheckbox(item),
       el("div", { class: "icon", text: icon(item.name, item.kind) }),
       el("div", {
         class: "name" + (isFolder ? " folder" : ""),
@@ -687,6 +883,33 @@ $("#newFolder").addEventListener("click", () => {
 for (const btn of document.querySelectorAll(".nav-item")) {
   btn.addEventListener("click", () => setView(btn.dataset.view))
 }
+
+let searchTimer = 0
+$("#searchInput").addEventListener("input", (event) => {
+  const value = event.target.value.trim()
+  clearTimeout(searchTimer)
+  if (!value) {
+    exitSearch()
+    setView(state.view === "trash" ? "trash" : "files")
+    return
+  }
+  searchTimer = setTimeout(() => {
+    state.searching = true
+    $("#newFolder").style.display = "none"
+    loadSearch(value)
+  }, 220)
+})
+$("#searchInput").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.target.value = ""
+    exitSearch()
+    setView("files")
+  }
+})
+
+$("#batchDelete").addEventListener("click", () => batchDelete())
+$("#batchMove").addEventListener("click", () => batchMove())
+$("#batchClear").addEventListener("click", () => clearSelection())
 
 let dragDepth = 0
 window.addEventListener("dragenter", (event) => {
