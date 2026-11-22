@@ -131,9 +131,88 @@ async function copyText(text) {
 // Thumbnails are the original file scaled down by the browser, so keep them lazy
 // and skip anything large: without a server-side decoder there is nothing to shrink.
 const THUMB_MAX_BYTES = 8 * 1024 * 1024
+const PDF_THUMB_MAX_BYTES = 40 * 1024 * 1024
+
+// ---------- pdf.js ----------
+const pdfjs = window.pdfjsLib || null
+if (pdfjs) pdfjs.GlobalWorkerOptions.workerSrc = "vendor/pdf.worker.min.js"
+
+const pdfDocs = new Map()     // nodeId -> Promise<PDFDocumentProxy>
+const pdfThumbs = new Map()   // nodeId -> data URL
+const pdfRenderQueue = []
+let pdfRenderActive = 0
+const PDF_RENDER_CONCURRENCY = 2
+
+function loadPdfDoc(id) {
+  if (!pdfjs) return Promise.reject(new Error("pdf.js 未加载"))
+  if (!pdfDocs.has(id)) {
+    pdfDocs.set(id, pdfjs.getDocument({ url: "api/download/" + id + "?inline=1", withCredentials: true }).promise)
+  }
+  return pdfDocs.get(id)
+}
+
+function schedulePdfThumb(id, item) {
+  const job = () => renderPdfThumb(id, item)
+  const task = { job }
+  const index = pdfRenderQueue.findIndex((t) => t.id === id)
+  if (index >= 0) return pdfRenderQueue[index].promise
+  const promise = new Promise((resolve) => {
+    pdfRenderQueue.push({ id, job: async () => { try { resolve(await job()) } catch (e) { resolve(null) } } })
+  })
+  pdfRenderQueue[pdfRenderQueue.length - 1].promise = promise
+  pumpPdfQueue()
+  return promise
+}
+
+function pumpPdfQueue() {
+  while (pdfRenderActive < PDF_RENDER_CONCURRENCY && pdfRenderQueue.length > 0) {
+    const task = pdfRenderQueue.shift()
+    pdfRenderActive++
+    Promise.resolve(task.job()).finally(() => {
+      pdfRenderActive--
+      pumpPdfQueue()
+    })
+  }
+}
+
+async function renderPdfThumb(id, item) {
+  if (pdfThumbs.has(id)) return pdfThumbs.get(id)
+  const doc = await loadPdfDoc(id)
+  const page = await doc.getPage(1)
+  const base = page.getViewport({ scale: 1 })
+  const target = 56 * 2
+  const scale = Math.min(target / base.width, target / base.height)
+  const viewport = page.getViewport({ scale: Math.max(0.1, scale) })
+  const canvas = document.createElement("canvas")
+  canvas.width = Math.ceil(viewport.width)
+  canvas.height = Math.ceil(viewport.height)
+  const ctx = canvas.getContext("2d")
+  ctx.fillStyle = "#fff"
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
+  await page.render({ canvasContext: ctx, viewport }).promise
+  const url = canvas.toDataURL("image/png")
+  pdfThumbs.set(id, url)
+  return url
+}
 
 function fileGlyph(item) {
-  if (previewKind(item.name) === "image" && item.size <= THUMB_MAX_BYTES) {
+  const kind = previewKind(item.name)
+  if (kind === "pdf" && pdfjs && item.size <= PDF_THUMB_MAX_BYTES) {
+    const holder = el("div", { class: "thumb thumb-pdf" })
+    const img = document.createElement("img")
+    img.className = "thumb"
+    img.alt = ""
+    img.addEventListener("error", () => {
+      holder.replaceWith(el("div", { class: "icon", text: icon(item.name, item.kind) }))
+    })
+    holder.append(img)
+    schedulePdfThumb(item.id, item).then((url) => {
+      if (url) img.src = url
+      else holder.replaceWith(el("div", { class: "icon", text: icon(item.name, item.kind) }))
+    })
+    return holder
+  }
+  if (kind === "image" && item.size <= THUMB_MAX_BYTES) {
     const img = document.createElement("img")
     img.className = "thumb"
     img.src = "api/download/" + item.id + "?inline=1"
@@ -240,7 +319,7 @@ function openPreview(item, siblings) {
       if (kind === "image") {
         stage.append(el("img", { src: url, alt: current.name }))
       } else if (kind === "pdf") {
-        stage.append(el("iframe", { src: url, title: current.name }))
+        renderPdfViewer(stage, modal, current, api)
       } else if (kind === "video") {
         const video = document.createElement("video")
         video.src = url
@@ -299,6 +378,114 @@ function openPreview(item, siblings) {
     body.append(prev, next)
     show(index)
   })
+}
+
+function renderPdfViewer(stage, modal, item, api) {
+  modal.classList.add("preview-pdf")
+  stage.classList.add("pdf-stage")
+  stage.innerHTML = ""
+
+  const canvas = document.createElement("canvas")
+  const holder = el("div", { class: "pdf-canvas-holder" }, [canvas])
+  const pageLabel = el("span", { class: "pdf-page", text: "…" })
+  const zoomLabel = el("span", { class: "pdf-zoom", text: "100%" })
+  const bar = el("div", { class: "pdf-toolbar" }, [
+    el("button", { class: "pdf-btn", text: "−", onclick: () => setZoom(zoom / 1.25) }),
+    zoomLabel,
+    el("button", { class: "pdf-btn", text: "+", onclick: () => setZoom(zoom * 1.25) }),
+    el("span", { class: "pdf-sep" }),
+    el("button", { class: "pdf-btn", text: "‹", onclick: () => setPage(page - 1) }),
+    pageLabel,
+    el("button", { class: "pdf-btn", text: "›", onclick: () => setPage(page + 1) }),
+    el("span", { class: "pdf-sep" }),
+    el("button", { class: "pdf-btn wide", text: "适应宽度", onclick: () => { fitWidth = true; setZoom(1) } }),
+    el("a", { class: "pdf-btn wide", href: "api/download/" + item.id, target: "_blank", rel: "noopener", text: "原始文件" }),
+  ])
+  stage.append(bar, holder)
+
+  let doc = null
+  let page = 1
+  let zoom = 1
+  let fitWidth = true
+  let renderTask = null
+  let destroyed = false
+
+  function setZoom(next) {
+    zoom = Math.min(6, Math.max(0.2, next))
+    fitWidth = false
+    draw()
+  }
+
+  function setPage(next) {
+    if (!doc) return
+    page = Math.min(doc.numPages, Math.max(1, next))
+    draw()
+  }
+
+  async function draw() {
+    if (!doc) return
+    if (renderTask) {
+      try { renderTask.cancel() } catch (err) { /* ignore */ }
+      renderTask = null
+    }
+    const pdfPage = await doc.getPage(page)
+    if (destroyed) return
+    const base = pdfPage.getViewport({ scale: 1 })
+    const available = Math.max(320, holder.clientWidth - 4)
+    const scale = fitWidth ? available / base.width : (available / base.width) * zoom
+    const dpr = Math.min(2, window.devicePixelRatio || 1)
+    const viewport = pdfPage.getViewport({ scale: scale * dpr })
+    canvas.width = Math.floor(viewport.width)
+    canvas.height = Math.floor(viewport.height)
+    canvas.style.width = Math.floor(viewport.width / dpr) + "px"
+    canvas.style.height = Math.floor(viewport.height / dpr) + "px"
+    const ctx = canvas.getContext("2d")
+    ctx.fillStyle = "#fff"
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+    try {
+      renderTask = pdfPage.render({ canvasContext: ctx, viewport })
+      await renderTask.promise
+    } catch (err) {
+      if (err && err.name === "RenderingCancelledException") return
+    }
+    renderTask = null
+    pageLabel.textContent = page + " / " + doc.numPages
+    zoomLabel.textContent = Math.round((fitWidth ? available / base.width : zoom) * 100) + "%"
+  }
+
+  stage.addEventListener("wheel", (event) => {
+    if (!event.ctrlKey && !event.metaKey) return
+    event.preventDefault()
+    setZoom(zoom * (event.deltaY < 0 ? 1.1 : 0.9))
+  }, { passive: false })
+
+  const onKey = (event) => {
+    if (event.key === "PageDown" || event.key === "ArrowDown") { event.preventDefault(); setPage(page + 1) }
+    if (event.key === "PageUp" || event.key === "ArrowUp") { event.preventDefault(); setPage(page - 1) }
+    if (event.key === "+" || event.key === "=") { event.preventDefault(); setZoom(zoom * 1.25) }
+    if (event.key === "-") { event.preventDefault(); setZoom(zoom / 1.25) }
+  }
+  document.addEventListener("keydown", onKey)
+  api.onClose(() => {
+    destroyed = true
+    document.removeEventListener("keydown", onKey)
+    if (doc) doc.destroy().catch(() => {})
+  })
+
+  loadPdfDoc(item.id)
+    .then((loaded) => {
+      if (destroyed) return
+      doc = loaded
+      page = 1
+      draw()
+    })
+    .catch(() => {
+      holder.innerHTML = ""
+      holder.append(el("div", { class: "preview-empty" }, [
+        el("div", { text: "PDF 加载失败" }),
+        el("a", { class: "btn small", href: "api/download/" + item.id, text: "下载" }),
+      ]))
+    })
 }
 
 function openShare(item) {
