@@ -402,7 +402,15 @@ function openShare(item) {
     }
     const result = el("div", { class: "share-result" })
     const primary = el("button", { class: "btn", text: "创建链接" })
+    // One handler, three states. Assigning a second onclick on top of the listener
+    // used to fire the create path again, which produced two links per share.
+    let phase = "idle"
     primary.addEventListener("click", async () => {
+      if (phase === "done") { close(); return }
+      if (phase === "busy") return
+      phase = "busy"
+      primary.disabled = true
+      primary.textContent = "创建中…"
       try {
         localStorage.setItem("ds.shareTtl", String(selected))
         const data = await post("api/shares", { nodeId: item.id, ttlHours: selected })
@@ -410,11 +418,15 @@ function openShare(item) {
         const copied = await copyText(url)
         result.append(el("div", { class: "share-url", text: url }))
         result.append(el("div", { class: "hint", text: copied ? "已复制到剪贴板" : "复制失败，可以手动选中上方的链接" }))
+        phase = "done"
+        primary.disabled = false
         primary.textContent = "完成"
-        primary.onclick = close
         toast("分享链接已生成")
         refreshState()
       } catch (err) {
+        phase = "idle"
+        primary.disabled = false
+        primary.textContent = "重试"
         toast(err.message, true)
       }
     })

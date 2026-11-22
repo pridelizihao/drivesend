@@ -265,6 +265,7 @@ node test/delete.mjs     # 删除语义与空间回收（9 项断言）
 node test/preview.mjs    # 预览内联白名单与安全头
 node test/auth.mjs       # 账户、会话与配额（21 项断言）
 node test/version.mjs    # 版本替换与阅读页（11 项断言）
+node test/share.mjs      # 分享链接去重（4 项断言）
 node test/sha256.mjs     # 纯 JS SHA-256 与原生实现比对
 ```
 

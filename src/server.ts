@@ -992,8 +992,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (node.kind !== "file") return fail(res, 400, "only files can be shared for now")
     const hours = Number(body.ttlHours ?? 0)
     const expiresAt = hours > 0 ? Date.now() + hours * 3600 * 1000 : null
+    // Reuse an existing link for the same file and the same lifetime instead of
+    // stacking duplicates when the button is clicked twice.
+    const existing = db.prepare(
+      "SELECT token, expires_at FROM shares WHERE node_id = ? AND ttl_hours = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC LIMIT 1"
+    ).get(node.id, hours, Date.now()) as any
+    if (existing) return sendJson(res, 200, { token: existing.token, expiresAt: existing.expires_at, url: BASE + "/s/" + existing.token, reused: true })
     const token = randomBytes(12).toString("base64url")
-    db.prepare("INSERT INTO shares (token, node_id, expires_at, created_at, downloads) VALUES (?, ?, ?, ?, 0)").run(token, node.id, expiresAt, Date.now())
+    db.prepare("INSERT INTO shares (token, node_id, expires_at, created_at, downloads, ttl_hours) VALUES (?, ?, ?, ?, 0, ?)").run(token, node.id, expiresAt, Date.now(), hours)
     return sendJson(res, 200, { token, expiresAt, url: BASE + "/s/" + token })
   }
 
