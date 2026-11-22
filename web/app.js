@@ -948,9 +948,22 @@ async function refreshState() {
     const badge = $("#inboxBadge")
     badge.hidden = data.inbox.count === 0
     badge.textContent = String(data.inbox.count)
-    $("#usage").textContent = humanSize(data.stats.logicalBytes)
-    $("#saved").textContent = "实际占用 " + humanSize(data.stats.physicalBytes) +
-      (data.stats.savedBytes > 0 ? " · 去重省下 " + humanSize(data.stats.savedBytes) : "")
+    const storage = data.storage || { usedBytes: data.stats.logicalBytes, quotaBytes: 0 }
+    const quota = storage.quotaBytes || 0
+    $("#usage").textContent = humanSize(storage.usedBytes) + (quota > 0 ? " / " + humanSize(quota) : "")
+    const fill = $("#quotaFill")
+    const ratio = quota > 0 ? Math.min(1, storage.usedBytes / quota) : 0
+    fill.style.width = (ratio * 100).toFixed(1) + "%"
+    fill.style.background = ratio > 0.92 ? "linear-gradient(90deg,#ff9f0a,#ff3b30)"
+      : ratio > 0.75 ? "linear-gradient(90deg,#ffd60a,#ff9f0a)"
+      : "linear-gradient(90deg,#0a84ff,#64d2ff)"
+    $("#saved").textContent = storage.usedBytes > data.stats.physicalBytes
+      ? "其中去重省下 " + humanSize(Math.max(0, storage.usedBytes - data.stats.physicalBytes))
+      : "实际占用 " + humanSize(data.stats.physicalBytes)
+    if (data.user) {
+      $("#userBtn").hidden = false
+      $("#userName").textContent = data.user.username
+    }
     const conn = $("#conn")
     conn.textContent = "已连接"
     conn.className = "pill on"
@@ -993,6 +1006,18 @@ $("#fileInput").addEventListener("change", (event) => {
   if (files.length) uploadMany(files)
 })
 $("#qrBtn").addEventListener("click", () => openPair())
+$("#userBtn").addEventListener("click", (event) => {
+  event.stopPropagation()
+  const menu = $("#userMenu")
+  menu.hidden = !menu.hidden
+})
+document.addEventListener("click", () => { $("#userMenu").hidden = true })
+$("#logoutBtn").addEventListener("click", async () => {
+  try {
+    await post("api/auth/logout", {})
+  } catch (err) { /* ignore */ }
+  location.reload()
+})
 $("#newFolder").addEventListener("click", () => {
   promptModal("新建文件夹", "新建文件夹", "文件夹名称", async (name) => {
     try {

@@ -47,9 +47,24 @@
 | 在线预览 | 图片、PDF、视频、音频、文本直接在页面内打开，可左右切换同目录文件 |
 | 图片缩略图 | 列表中以缩略图代替通用图标（懒加载，超过 8 MB 的图片回退为图标） |
 | 手机配对 | 传输站内生成二维码，扫码直接登录，无需输入令牌 |
+| 账户 | 用户名 + 密码登录，scrypt 哈希，会话 30 天 |
+| 配额 | 默认 15 GB，侧栏显示用量条，超限上传前拦截 |
 | 存储统计 | 区分「逻辑占用」与「实际占用」，直观看到去重省了多少 |
 
 界面为 iOS / macOS 风格的磨砂玻璃主题，零构建、零框架。
+
+## 账户与配额
+
+首次打开实例会引导创建账户（用户名 + 密码），之后用账号登录，会话保存在 HttpOnly Cookie 里 30 天。
+
+- 密码用 `scrypt` 加盐哈希存储，登录失败按 IP 限速（15 分钟内 10 次）
+- 支持多个账户，但**文件是共享的**：这套东西定位是单人自托管，多用户隔离需要给节点加 owner，
+  属于另一个量级的改动，暂未做
+- `DS_TOKEN` 是应急钥匙：即使一个账户都没有，用 `?token=xxx` 或 Bearer 仍能进入，
+  避免忘记密码后彻底锁死
+
+配额默认 15 GB（`QUOTA_BYTES` 可改），按**所有文件**计算，包括回收站里的内容——
+因为它们在磁盘上确实占着空间。超出时上传会在开始前就被拒绝，并提示剩余多少。
 
 ## 快速开始
 
@@ -70,7 +85,9 @@ node src/server.ts
 | `PORT` | `8787` | 监听端口 |
 | `HOST` | `127.0.0.1` | 监听地址 |
 | `DATA_DIR` | `./data` | 数据目录（SQLite + blob 存储） |
-| `DS_TOKEN` | 空 | 访问令牌。公网部署必须设置，留空即无鉴权 |
+| `DS_TOKEN` | 空 | 应急令牌。设置后可用 `?token=` 或 Bearer 绕过账号直接访问 |
+| `QUOTA_BYTES` | `16106127360`（15 GB） | 存储配额，按所有文件（含回收站）计算 |
+| `SESSION_DAYS` | `30` | 登录会话有效天数 |
 | `BASE_PATH` | 空 | 子路径部署前缀，如 `/drive` |
 | `INBOX_TTL_H` | `24` | 传输站文件存活小时数 |
 | `TRASH_TTL_H` | `720` | 回收站保留小时数（默认 30 天） |
@@ -149,7 +166,11 @@ GET    /api/shares                 链接列表
 DELETE /api/shares/:token          撤销链接
 GET    /s/:token                   分享落地页
 
-GET    /api/state                  统计信息
+POST   /api/auth/setup             创建首个账户
+POST   /api/auth/login             登录
+POST   /api/auth/logout            退出
+GET    /api/auth/me                当前用户 / 是否需要初始化
+GET    /api/state                  统计、配额与当前用户
 GET    /api/pair-url               生成带令牌的登录地址（供二维码）
 GET    /api/events                 SSE：inbox / files 事件
 ```
@@ -201,7 +222,8 @@ location /drive/ {
 
 ## 安全模型
 
-- 单个访问令牌保护所有 API。首次访问 `/?token=xxx` 后写入 HttpOnly Cookie，有效期 30 天。
+- 账号密码保护所有 API，会话写入 HttpOnly Cookie，有效期 30 天。
+- `DS_TOKEN` 作为应急钥匙保留：可绕过账号访问，用于自动化脚本或找回访问权。
 - **分享链接不需要令牌**——这是分享的语义。令牌为 96 位随机串，无法猜测，但链接一旦转发即等同放行。
 - 传输站文件默认 24 小时过期，领取即可删除。
 - 当前无内置 TLS。公网部署请在前面加一层 HTTPS，否则令牌与文件内容均为明文传输。
@@ -231,6 +253,7 @@ node test/inbox.mjs      # 传输站流程（10 项断言）
 node test/trash.mjs      # 回收站、恢复、搜索（16 项断言）
 node test/delete.mjs     # 删除语义与空间回收（9 项断言）
 node test/preview.mjs    # 预览内联白名单与安全头
+node test/auth.mjs       # 账户、会话与配额（21 项断言）
 node test/sha256.mjs     # 纯 JS SHA-256 与原生实现比对
 ```
 
@@ -248,6 +271,7 @@ BASE=https://drive.example.com/drive DS_AUTH=<token> node test/smoke.mjs
 - [x] 分享链接、移动、重命名、二维码配对
 - [x] 回收站、全盘搜索、多选批量操作
 - [x] 在线预览（图片 / PDF / 音视频 / 文本）
+- [x] 账号密码登录、存储配额
 - [ ] 局域网直连（mDNS 发现 + 不经服务器的直传）
 - [ ] 块级去重与增量同步
 - [ ] 回收站

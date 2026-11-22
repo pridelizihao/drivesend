@@ -6,12 +6,19 @@
 <meta name="theme-color" content="#f5f5f7">
 <meta name="color-scheme" content="light">
 <title>DriveSend</title>
-<link rel="stylesheet" href="style.css?v=13">
+<link rel="stylesheet" href="style.css?v=14">
 </head>
 <body>
 <header class="top">
   <div class="brand"><span class="dot"></span>DriveSend</div>
-  <div class="me"><span id="deviceName">本机</span><span id="conn" class="pill">连接中</span></div>
+  <div class="me">
+    <span id="deviceName">本机</span>
+    <span id="conn" class="pill">连接中</span>
+    <button id="userBtn" class="user-btn" hidden><span id="userName"></span></button>
+    <div id="userMenu" class="user-menu" hidden>
+      <button id="logoutBtn">退出登录</button>
+    </div>
+  </div>
 </header>
 
 <div class="layout">
@@ -23,6 +30,7 @@
     <div class="meter">
       <div class="meter-label">已用空间</div>
       <div id="usage">—</div>
+      <div class="quota-bar"><i id="quotaFill"></i></div>
       <div class="meter-sub" id="saved"></div>
     </div>
   </nav>
@@ -56,6 +64,6 @@
 <div id="queue" class="queue"></div>
 <div id="toasts" class="toasts"></div>
 <script src="qrcode.js?v=1"></script>
-<script type="module" src="app.js?v=13"></script>
+<script type="module" src="app.js?v=14"></script>
 </body>
 </html>

@@ -1,8 +1,9 @@
-const BASE = "http://127.0.0.1:8791"
-const H = { "content-type": "application/json" }
+import { authHeaders } from "./_auth.mjs"
+const BASE = process.env.BASE || "http://127.0.0.1:8787"
+const H = await authHeaders(BASE)
 async function upload(name, buf) {
   const init = await (await fetch(BASE + "/api/upload/init", { method: "POST", headers: H, body: JSON.stringify({ name, size: buf.length, hash: null, parentId: null }) })).json()
-  await fetch(BASE + "/api/upload/" + init.uploadId + "?offset=0", { method: "PUT", body: buf })
+  await fetch(BASE + "/api/upload/" + init.uploadId + "?offset=0", { method: "PUT", body: buf, headers: H })
   return (await (await fetch(BASE + "/api/upload/" + init.uploadId + "/complete", { method: "POST", headers: H, body: "{}" })).json()).nodeId
 }
 const png = Buffer.from("89504e470d0a1a0a", "hex")
@@ -12,7 +13,7 @@ const txt = Buffer.from("hello preview")
 
 for (const [name, buf, expectInline] of [["a.png", png, true], ["b.svg", svg, false], ["c.html", html, false], ["d.txt", txt, true], ["e.pdf", Buffer.from("%PDF-1.4"), true]]) {
   const id = await upload(name, buf)
-  const res = await fetch(BASE + "/api/download/" + id + "?inline=1")
+  const res = await fetch(BASE + "/api/download/" + id + "?inline=1", { headers: H })
   const disp = res.headers.get("content-disposition") || ""
   const isInline = disp.startsWith("inline")
   const csp = res.headers.get("content-security-policy")
@@ -23,6 +24,6 @@ for (const [name, buf, expectInline] of [["a.png", png, true], ["b.svg", svg, fa
 }
 
 const id = await upload("f.txt", txt)
-const normal = await fetch(BASE + "/api/download/" + id)
+const normal = await fetch(BASE + "/api/download/" + id, { headers: H })
 console.log((normal.headers.get("content-disposition") || "").startsWith("attachment") ? "PASS default stays attachment" : "FAIL default disposition changed")
 await normal.arrayBuffer()

@@ -1,5 +1,6 @@
+import { authHeaders } from "./_auth.mjs"
 const BASE = process.env.BASE || "http://127.0.0.1:8789"
-const AUTH = process.env.DS_AUTH ? { authorization: "Bearer " + process.env.DS_AUTH } : {}
+const AUTH = await authHeaders(BASE)
 let pass = 0, fail = 0
 const check = (n, ok, extra) => { if (ok) { pass++; console.log("PASS", n) } else { fail++; console.log("FAIL", n, JSON.stringify(extra ?? "").slice(0, 160)) } }
 async function j(p, init) {

@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http"
 import { createReadStream } from "node:fs"
 import { mkdir, open as openFd, readFile, rename, stat, writeFile } from "node:fs/promises"
 import { extname, join, resolve } from "node:path"
-import { randomBytes, randomUUID } from "node:crypto"
+import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto"
 import { openDb } from "./db.ts"
 import { MIME, blobPath, ensureParent, fileExists, hashFile, removeQuiet } from "./storage.ts"
 
@@ -21,6 +21,8 @@ const INBOX_TTL = INBOX_TTL_H * 3600 * 1000
 const TRASH_TTL_H = Number(process.env.TRASH_TTL_H ?? 720)
 const TRASH_TTL = TRASH_TTL_H * 3600 * 1000
 const TOKEN = process.env.DS_TOKEN ?? ""
+const QUOTA_BYTES = Number(process.env.QUOTA_BYTES ?? 15 * 1024 * 1024 * 1024)
+const SESSION_DAYS = Number(process.env.SESSION_DAYS ?? 30)
 const RAW_BASE = process.env.BASE_PATH ?? ""
 const BASE = RAW_BASE.endsWith("/") ? RAW_BASE.slice(0, RAW_BASE.length - 1) : RAW_BASE
 
@@ -346,16 +348,100 @@ function loginPage(): string {
     "p{color:#6e6e73;font-size:13px;margin:0 0 18px}",
     "input{width:100%;padding:12px 14px;border-radius:12px;border:1px solid rgba(0,0,0,.1);background:rgba(255,255,255,.9);color:#1d1d1f;font-size:14px;outline:none}",
     "input:focus{border-color:rgba(0,113,227,.6);box-shadow:0 0 0 4px rgba(0,113,227,.12)}",
+    "input+input{margin-top:10px}",
+    ".err{color:#d70015;font-size:12px;min-height:16px;margin-top:8px}",
     "button{width:100%;margin-top:12px;padding:12px;border:0;border-radius:980px;background:linear-gradient(180deg,#0a84ff,#0071e3);color:#fff;font-weight:600;font-size:14px;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,.12),inset 0 1px 0 rgba(255,255,255,.24)}",
     "</style>",
-    "<form class=\"card\" method=\"get\" action=\"" + BASE + "/\">",
+    "<form class=\"card\" id=\"f\">",
     "<h1>DriveSend</h1>",
-    "<p>这个实例需要访问令牌</p>",
-    "<input name=\"token\" type=\"password\" placeholder=\"访问令牌\" autofocus>",
-    "<button>进入</button>",
+    "<p id=\"hint\">登录以继续</p>",
+    "<input id=\"u\" name=\"username\" placeholder=\"用户名\" autocomplete=\"username\" autofocus>",
+    "<input id=\"p\" name=\"password\" type=\"password\" placeholder=\"密码\" autocomplete=\"current-password\">",
+    "<input id=\"p2\" type=\"password\" placeholder=\"再输入一次密码\" hidden>",
+    "<div id=\"err\" class=\"err\"></div>",
+    "<button id=\"go\">登录</button>",
     "</form>",
+    "<script>",
+    "const BASE=" + JSON.stringify(BASE) + ";",
+    "let setup=false;",
+    "fetch(BASE+'/api/auth/me',{credentials:'same-origin'}).then(r=>r.json()).then(d=>{",
+    "  if(d.setupRequired){setup=true;document.getElementById('hint').textContent='第一次使用，创建一个账户';document.getElementById('go').textContent='创建账户';document.getElementById('p').setAttribute('autocomplete','new-password');document.getElementById('p2').hidden=false;}",
+    "}).catch(()=>{});",
+    "document.getElementById('f').addEventListener('submit',async(e)=>{",
+    "  e.preventDefault();",
+    "  const u=document.getElementById('u').value.trim();",
+    "  const p=document.getElementById('p').value;",
+    "  const p2=document.getElementById('p2').value;",
+    "  const err=document.getElementById('err');",
+    "  err.textContent='';",
+    "  if(setup&&p!==p2){err.textContent='两次输入的密码不一致';return;}",
+    "  const url=BASE+(setup?'/api/auth/setup':'/api/auth/login');",
+    "  const res=await fetch(url,{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:JSON.stringify({username:u,password:p})});",
+    "  if(res.ok){location.href=BASE+'/';return;}",
+    "  let msg='登录失败';try{const d=await res.json();if(d.error)msg=d.error;}catch(_){}err.textContent=msg;",
+    "});",
+    "</script>",
   ]
   return lines.join("\n")
+}
+
+function hashPassword(password: string, salt: string): string {
+  return scryptSync(password, salt, 64).toString("hex")
+}
+
+function verifyPassword(password: string, salt: string, expected: string): boolean {
+  const actual = Buffer.from(hashPassword(password, salt), "hex")
+  const target = Buffer.from(expected, "hex")
+  if (actual.length !== target.length) return false
+  return timingSafeEqual(actual, target)
+}
+
+function userCount(): number {
+  return (db.prepare("SELECT COUNT(*) AS c FROM users").get() as any).c as number
+}
+
+function sessionUser(req: IncomingMessage): any | null {
+  const token = readCookie(req, "ds_session")
+  if (!token) return null
+  const row = db.prepare(
+    "SELECT s.token, s.expires_at, u.id, u.username FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?"
+  ).get(token) as any
+  if (!row) return null
+  if (row.expires_at < Date.now()) {
+    db.prepare("DELETE FROM sessions WHERE token = ?").run(token)
+    return null
+  }
+  return row
+}
+
+function createSession(userId: string): string {
+  const token = randomBytes(24).toString("base64url")
+  const now = Date.now()
+  db.prepare("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)").run(
+    token, userId, now, now + SESSION_DAYS * 86400000
+  )
+  return token
+}
+
+function authEnabled(): boolean {
+  return TOKEN !== "" || userCount() > 0
+}
+
+const loginAttempts = new Map<string, { count: number; resetAt: number }>()
+
+function throttled(key: string): boolean {
+  const now = Date.now()
+  const entry = loginAttempts.get(key)
+  if (!entry || entry.resetAt < now) {
+    loginAttempts.set(key, { count: 1, resetAt: now + 15 * 60 * 1000 })
+    return false
+  }
+  entry.count += 1
+  return entry.count > 10
+}
+
+function usedBytes(): number {
+  return (db.prepare("SELECT COALESCE(SUM(size),0) AS s FROM nodes WHERE kind = 'file'").get() as any).s as number
 }
 
 function readCookie(req: IncomingMessage, key: string): string | null {
@@ -369,7 +455,8 @@ function readCookie(req: IncomingMessage, key: string): string | null {
 }
 
 function authed(req: IncomingMessage, url: URL): boolean {
-  if (!TOKEN) return true
+  if (sessionUser(req)) return true
+  if (!TOKEN) return false
   if (String(req.headers.authorization ?? "") === "Bearer " + TOKEN) return true
   if (readCookie(req, "ds_token") === TOKEN) return true
   if (url.searchParams.get("token") === TOKEN) return true
@@ -381,20 +468,86 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const path = url.pathname
   const method = req.method ?? "GET"
 
-  if (TOKEN) {
+  if (method === "POST" && path === "/api/auth/setup") {
+    if (userCount() > 0) return fail(res, 400, "账户已存在")
+    const body = await readJson(req)
+    const username = String(body.username ?? "").trim()
+    const password = String(body.password ?? "")
+    if (username.length < 2) return fail(res, 400, "用户名至少 2 个字符")
+    if (password.length < 6) return fail(res, 400, "密码至少 6 位")
+    const salt = randomBytes(16).toString("hex")
+    const id = randomUUID()
+    db.prepare("INSERT INTO users (id, username, password_hash, salt, created_at) VALUES (?, ?, ?, ?, ?)").run(
+      id, username, hashPassword(password, salt), salt, Date.now()
+    )
+    const session = createSession(id)
+    res.writeHead(200, {
+      "content-type": "application/json; charset=utf-8",
+      "set-cookie": "ds_session=" + session + "; Path=" + (BASE === "" ? "/" : BASE + "/") + "; HttpOnly; SameSite=Lax; Max-Age=" + SESSION_DAYS * 86400,
+    })
+    res.end(JSON.stringify({ ok: true, user: { id, username } }))
+    return
+  }
+
+  if (method === "POST" && path === "/api/auth/login") {
+    const ip = String(req.headers["x-forwarded-for"] ?? req.socket.remoteAddress ?? "local").split(",")[0].trim()
+    if (throttled(ip)) return fail(res, 429, "尝试次数过多，请稍后再试")
+    const body = await readJson(req)
+    const username = String(body.username ?? "").trim()
+    const password = String(body.password ?? "")
+    const user = db.prepare("SELECT * FROM users WHERE username = ?").get(username) as any
+    if (!user || !verifyPassword(password, user.salt, user.password_hash)) {
+      return fail(res, 401, "用户名或密码不正确")
+    }
+    db.prepare("UPDATE users SET last_login = ? WHERE id = ?").run(Date.now(), user.id)
+    const session = createSession(user.id)
+    res.writeHead(200, {
+      "content-type": "application/json; charset=utf-8",
+      "set-cookie": "ds_session=" + session + "; Path=" + (BASE === "" ? "/" : BASE + "/") + "; HttpOnly; SameSite=Lax; Max-Age=" + SESSION_DAYS * 86400,
+    })
+    res.end(JSON.stringify({ ok: true, user: { id: user.id, username: user.username } }))
+    return
+  }
+
+  if (method === "POST" && path === "/api/auth/logout") {
+    const token = readCookie(req, "ds_session")
+    if (token) db.prepare("DELETE FROM sessions WHERE token = ?").run(token)
+    res.writeHead(200, {
+      "content-type": "application/json; charset=utf-8",
+      "set-cookie": "ds_session=; Path=" + (BASE === "" ? "/" : BASE + "/") + "; HttpOnly; SameSite=Lax; Max-Age=0",
+    })
+    res.end(JSON.stringify({ ok: true }))
+    return
+  }
+
+  if (method === "GET" && path === "/api/auth/me") {
+    const user = sessionUser(req)
+    return sendJson(res, 200, {
+      user: user ? { id: user.id, username: user.username } : null,
+      setupRequired: userCount() === 0,
+      authEnabled: authEnabled(),
+    })
+  }
+
+  if (authEnabled()) {
     const supplied = url.searchParams.get("token")
-    if (supplied) {
-      if (supplied !== TOKEN) {
-        if (path.startsWith("/api/")) return fail(res, 401, "unauthorized")
-        res.writeHead(401, { "content-type": "text/html; charset=utf-8" })
-        res.end(loginPage())
-        return
-      }
+    if (supplied && TOKEN && supplied === TOKEN) {
       res.writeHead(302, {
         "set-cookie": "ds_token=" + TOKEN + "; Path=" + (BASE === "" ? "/" : BASE + "/") + "; HttpOnly; SameSite=Lax; Max-Age=2592000",
         location: BASE + "/",
       })
       res.end()
+      return
+    }
+    // The bearer/cookie token is the break-glass key: it works even before the
+    // first account exists, so locking yourself out is recoverable.
+    const tokenOk = TOKEN !== "" && (
+      String(req.headers.authorization ?? "") === "Bearer " + TOKEN || readCookie(req, "ds_token") === TOKEN
+    )
+    if (!tokenOk && userCount() === 0 && !path.startsWith("/s/")) {
+      if (path.startsWith("/api/")) return fail(res, 401, "请先创建账户")
+      res.writeHead(401, { "content-type": "text/html; charset=utf-8" })
+      res.end(loginPage())
       return
     }
     if (!path.startsWith("/s/") && !authed(req, url)) {
@@ -411,7 +564,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   if (method === "GET" && path === "/api/state") {
-    return sendJson(res, 200, { stats: stats(), inbox: inboxSummary() })
+    const user = sessionUser(req)
+    return sendJson(res, 200, {
+      stats: stats(),
+      inbox: inboxSummary(),
+      storage: { usedBytes: usedBytes(), quotaBytes: QUOTA_BYTES },
+      user: user ? { username: user.username } : null,
+    })
   }
 
   if (method === "GET" && path === "/api/files") {
@@ -450,6 +609,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const hash = typeof body.hash === "string" && /^[a-f0-9]{64}$/.test(body.hash) ? body.hash : null
     const parentId = body.parentId || null
     const expiresAt = parentId === INBOX ? Date.now() + INBOX_TTL : null
+    const alreadyStored = hash ? (db.prepare("SELECT 1 FROM blobs WHERE hash = ?").get(hash) !== undefined && await fileExists(blobPath(BLOBS, hash as string))) : false
+    if (!alreadyStored && usedBytes() + size > QUOTA_BYTES) {
+      return fail(res, 413, "空间不足，仅剩 " + humanSize(Math.max(0, QUOTA_BYTES - usedBytes())))
+    }
     if (hash) {
       const blob = db.prepare("SELECT 1 FROM blobs WHERE hash = ?").get(hash)
       if (blob && (await fileExists(blobPath(BLOBS, hash)))) {
@@ -514,6 +677,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       await removeQuiet(upload.path)
     } else {
       await rename(upload.path, target)
+    }
+    if (usedBytes() + info.size > QUOTA_BYTES) {
+      await removeQuiet(upload.path)
+      return fail(res, 413, "空间不足")
     }
     const toInbox = upload.parentId === INBOX
     if (toInbox) {
@@ -761,6 +928,7 @@ setInterval(async () => {
   const now = Date.now()
   await collectGarbage(null)
   db.prepare("DELETE FROM shares WHERE expires_at IS NOT NULL AND expires_at < ?").run(now)
+  db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(now)
   const expired = db.prepare("SELECT id FROM nodes WHERE expires_at IS NOT NULL AND expires_at < ? AND deleted = 0").all(now) as any[]
   const expiredHashes: string[] = []
   for (const row of expired) expiredHashes.push(...purgeTree(row.id))

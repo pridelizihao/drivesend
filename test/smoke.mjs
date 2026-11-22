@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto"
 
+import { authHeaders } from "./_auth.mjs"
 const BASE = process.env.BASE || "http://127.0.0.1:8787"
 let pass = 0
 let fail = 0
@@ -20,7 +21,7 @@ async function j(path, init) {
 
 const body = JSON.stringify
 const H = { "content-type": "application/json" }
-const AUTH = process.env.DS_AUTH ? { authorization: "Bearer " + process.env.DS_AUTH } : {}
+const AUTH = await authHeaders(BASE)
 
 const content = Buffer.from("你好 DriveSend —— 同一条内核，两个面孔\n" + Math.random().toString(36) + "x".repeat(5000))
 const hash = createHash("sha256").update(content).digest("hex")
@@ -28,6 +29,11 @@ const NAME = "测试-" + Date.now() + ".txt"
 
 let init = await j("/api/upload/init", { method: "POST", headers: H, body: body({ name: NAME, size: content.byteLength, hash, parentId: null }) })
 check("upload init", init.status === 200 && init.data.instant === false, init.data)
+if (!init.data.uploadId) {
+  console.log("---")
+  console.log("pass=" + pass + " fail=" + (fail + 1))
+  process.exit(1)
+}
 
 const uploadId = init.data.uploadId
 const chunkSize = init.data.chunkSize

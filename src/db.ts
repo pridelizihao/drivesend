@@ -8,6 +8,8 @@ const SCHEMA = [
   "CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes (parent_id, deleted, kind);",
   "CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes (parent_id, name, deleted);",
   "CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, name TEXT NOT NULL, last_seen INTEGER NOT NULL, created_at INTEGER NOT NULL);",
+  "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at INTEGER NOT NULL, last_login INTEGER);",
+  "CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);",
   "CREATE TABLE IF NOT EXISTS shares (token TEXT PRIMARY KEY, node_id TEXT NOT NULL, expires_at INTEGER, created_at INTEGER NOT NULL, downloads INTEGER NOT NULL DEFAULT 0);",
   "CREATE TABLE IF NOT EXISTS transfers (id TEXT PRIMARY KEY, node_id TEXT NOT NULL, to_device TEXT NOT NULL, from_device TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);",
   "CREATE INDEX IF NOT EXISTS idx_transfers_device ON transfers (to_device, status);",
