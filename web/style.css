@@ -291,6 +291,15 @@ button { font: inherit; color: inherit; }
 .danger-text { color: #d70015; }
 .danger-text:hover { background: rgba(255, 59, 48, 0.1); }
 
+.list-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 12px;
+  border-top: 1px solid var(--hairline);
+}
+
 .trash-foot {
   display: flex;
   align-items: center;

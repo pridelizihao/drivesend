@@ -1,6 +1,6 @@
 import http from "node:http"
 import type { IncomingMessage, ServerResponse } from "node:http"
-import { createReadStream } from "node:fs"
+import { createReadStream, readdirSync } from "node:fs"
 import { mkdir, open as openFd, readFile, rename, stat, writeFile } from "node:fs/promises"
 import { extname, join, resolve } from "node:path"
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto"
@@ -42,8 +42,43 @@ type Upload = {
   replaceNode: string | null
 }
 
-const uploads = new Map<string, Upload>()
 const subs = new Set<ServerResponse>()
+
+/** Run several statements atomically. A crash halfway through must not leave a
+ *  half-applied change, which matters most for replace-version and purge. */
+function tx<T>(fn: () => T): T {
+  db.exec("BEGIN IMMEDIATE")
+  try {
+    const result = fn()
+    db.exec("COMMIT")
+    return result
+  } catch (err) {
+    try { db.exec("ROLLBACK") } catch { /* already rolled back */ }
+    throw err
+  }
+}
+
+// Upload sessions live in the database, not in memory, so a restart does not
+// throw away a half-finished upload.
+function saveUpload(upload: Upload): void {
+  db.prepare(
+    "INSERT INTO uploads (id, name, parent_id, size, hash, path, received, replace_node, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+    "ON CONFLICT(id) DO UPDATE SET received = excluded.received"
+  ).run(upload.id, upload.name, upload.parentId, upload.size, upload.hash, upload.path, upload.received, upload.replaceNode, Date.now())
+}
+
+function loadUpload(id: string): Upload | null {
+  const row = db.prepare("SELECT * FROM uploads WHERE id = ?").get(id) as any
+  if (!row) return null
+  return {
+    id: row.id, name: row.name, parentId: row.parent_id, size: row.size, hash: row.hash,
+    path: row.path, received: row.received, replaceNode: row.replace_node,
+  }
+}
+
+function dropUpload(id: string): void {
+  db.prepare("DELETE FROM uploads WHERE id = ?").run(id)
+}
 
 function sendJson(res: ServerResponse, code: number, data: unknown): void {
   const body = JSON.stringify(data)
@@ -116,14 +151,20 @@ function createNode(kind: string, name: string, parentId: string | null, size: n
 }
 
 function createFileNode(name: string, parentId: string | null, size: number, hash: string, expiresAt: number | null = null): string {
-  const id = createNode("file", name, parentId, size, hash, expiresAt)
-  db.prepare("INSERT INTO blobs (hash, size, refs, created_at) VALUES (?, ?, 0, ?) ON CONFLICT(hash) DO NOTHING").run(hash, size, Date.now())
-  db.prepare("UPDATE blobs SET refs = refs + 1 WHERE hash = ?").run(hash)
-  return id
+  return tx(() => {
+    const id = createNode("file", name, parentId, size, hash, expiresAt)
+    db.prepare("INSERT INTO blobs (hash, size, refs, created_at) VALUES (?, ?, 0, ?) ON CONFLICT(hash) DO NOTHING").run(hash, size, Date.now())
+    db.prepare("UPDATE blobs SET refs = refs + 1 WHERE hash = ?").run(hash)
+    return id
+  })
 }
 
 /** Soft delete: the subtree moves to the trash, content is retained. */
 function deleteTree(id: string): void {
+  tx(() => softDeleteTree(id))
+}
+
+function softDeleteTree(id: string): void {
   const now = Date.now()
   const stack: string[] = [id]
   const touched: string[] = []
@@ -140,22 +181,24 @@ function deleteTree(id: string): void {
 
 /** Hard delete: rows disappear and blob references are dropped. Used by purge and by 传输站 burn. */
 function purgeTree(id: string): string[] {
-  const hashes: string[] = []
-  const stack: string[] = [id]
-  let guard = 0
-  while (stack.length > 0 && guard++ < 100000) {
-    const current = stack.pop() as string
-    const children = db.prepare("SELECT id FROM nodes WHERE parent_id = ?").all(current) as any[]
-    for (const child of children) stack.push(child.id)
-    const row = db.prepare("SELECT blob_hash FROM nodes WHERE id = ?").get(current) as any
-    if (row && row.blob_hash) hashes.push(row.blob_hash)
-    db.prepare("DELETE FROM shares WHERE node_id = ?").run(current)
-    db.prepare("DELETE FROM nodes WHERE id = ?").run(current)
-  }
-  for (const hash of hashes) {
-    db.prepare("UPDATE blobs SET refs = refs - 1 WHERE hash = ?").run(hash)
-  }
-  return hashes
+  return tx(() => {
+    const hashes: string[] = []
+    const stack: string[] = [id]
+    let guard = 0
+    while (stack.length > 0 && guard++ < 100000) {
+      const current = stack.pop() as string
+      const children = db.prepare("SELECT id FROM nodes WHERE parent_id = ?").all(current) as any[]
+      for (const child of children) stack.push(child.id)
+      const row = db.prepare("SELECT blob_hash FROM nodes WHERE id = ?").get(current) as any
+      if (row && row.blob_hash) hashes.push(row.blob_hash)
+      db.prepare("DELETE FROM shares WHERE node_id = ?").run(current)
+      db.prepare("DELETE FROM nodes WHERE id = ?").run(current)
+    }
+    for (const hash of hashes) {
+      db.prepare("UPDATE blobs SET refs = refs - 1 WHERE hash = ?").run(hash)
+    }
+    return hashes
+  })
 }
 
 async function collectGarbage(hashes: string[] | null): Promise<void> {
@@ -686,7 +729,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const exists = db.prepare("SELECT 1 FROM nodes WHERE id = ? AND deleted = 0").get(parent)
       if (!exists) return fail(res, 404, "folder not found")
     }
-    const rows = db.prepare("SELECT id, name, kind, size, blob_hash, mtime FROM nodes WHERE parent_id IS ? AND deleted = 0 AND id <> 'inbox' ORDER BY (kind = 'folder') DESC, name COLLATE NOCASE ASC").all(parent) as any[]
+    const limit = Math.min(1000, Math.max(1, Number(url.searchParams.get("limit") ?? 200)))
+    const offset = Math.max(0, Number(url.searchParams.get("offset") ?? 0))
+    const total = (db.prepare("SELECT COUNT(*) AS c FROM nodes WHERE parent_id IS ? AND deleted = 0 AND id <> 'inbox'").get(parent) as any).c as number
+    const rows = db.prepare(
+      "SELECT id, name, kind, size, blob_hash, mtime FROM nodes WHERE parent_id IS ? AND deleted = 0 AND id <> 'inbox' " +
+      "ORDER BY (kind = 'folder') DESC, name COLLATE NOCASE ASC LIMIT ? OFFSET ?"
+    ).all(parent, limit, offset) as any[]
     const crumbs: Array<{ id: string; name: string }> = []
     let cur = parent
     let guard = 0
@@ -699,6 +748,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return sendJson(res, 200, {
       parent,
       breadcrumb: crumbs,
+      total,
+      offset,
+      limit,
+      hasMore: offset + rows.length < total,
       items: rows.map((r) => ({ id: r.id, name: r.name, kind: r.kind, size: r.size, hash: r.blob_hash, mtime: r.mtime })),
     })
   }
@@ -729,7 +782,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         return fail(res, 413, "空间不足，仅剩 " + humanSize(Math.max(0, QUOTA_BYTES - usedBytes())))
       }
       const id = randomUUID()
-      uploads.set(id, { id, name: existing.id, parentId, size, hash, path: join(TMP, id + ".part"), received: 0, replaceNode })
+      const session: Upload = { id, name: existing.id, parentId, size, hash, path: join(TMP, id + ".part"), received: 0, replaceNode }
+      saveUpload(session)
       return sendJson(res, 200, { instant: false, uploadId: id, chunkSize: CHUNK, replace: true })
     }
     const alreadyStored = hash ? (db.prepare("SELECT 1 FROM blobs WHERE hash = ?").get(hash) !== undefined && await fileExists(blobPath(BLOBS, hash as string))) : false
@@ -755,13 +809,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     const id = randomUUID()
     const upload: Upload = { id, name, parentId, size, hash, path: join(TMP, id + ".part"), received: 0, replaceNode: replaceNode }
-    uploads.set(id, upload)
+    saveUpload(upload)
     return sendJson(res, 200, { instant: false, uploadId: id, chunkSize: CHUNK })
   }
 
   const chunkMatch = /^\/api\/upload\/([0-9a-f-]+)$/.exec(path)
   if (chunkMatch && (method === "PUT" || method === "GET")) {
-    const upload = uploads.get(chunkMatch[1])
+    const upload = loadUpload(chunkMatch[1])
     if (!upload) return fail(res, 404, "upload not found")
     if (method === "GET") return sendJson(res, 200, { received: upload.received, size: upload.size })
     const offset = Number(url.searchParams.get("offset") ?? 0)
@@ -775,14 +829,15 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       await fh.close()
     }
     upload.received = Math.max(upload.received, offset + buf.length)
+    saveUpload(upload)
     return sendJson(res, 200, { received: upload.received })
   }
 
   const completeMatch = /^\/api\/upload\/([0-9a-f-]+)\/complete$/.exec(path)
   if (completeMatch && method === "POST") {
-    const upload = uploads.get(completeMatch[1])
+    const upload = loadUpload(completeMatch[1])
     if (!upload) return fail(res, 404, "upload not found")
-    uploads.delete(upload.id)
+    dropUpload(upload.id)
     if (upload.size === 0 && !(await fileExists(upload.path))) await writeFile(upload.path, Buffer.alloc(0))
     const info = await stat(upload.path)
     if (upload.size > 0 && info.size !== upload.size) {
@@ -808,14 +863,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (upload.replaceNode) {
       const node = db.prepare("SELECT id, blob_hash, size FROM nodes WHERE id = ?").get(upload.replaceNode) as any
       if (!node) return fail(res, 404, "file not found")
-      if (node.blob_hash) {
-        db.prepare("INSERT INTO versions (id, node_id, blob_hash, size, created_at) VALUES (?, ?, ?, ?, ?)").run(
-          randomUUID(), node.id, node.blob_hash, node.size ?? 0, Date.now()
-        )
-        db.prepare("UPDATE blobs SET refs = refs - 1 WHERE hash = ?").run(node.blob_hash)
-      }
-      db.prepare("INSERT INTO blobs (hash, size, refs, created_at) VALUES (?, ?, 1, ?) ON CONFLICT(hash) DO UPDATE SET refs = refs + 1").run(actual, info.size, Date.now())
-      db.prepare("UPDATE nodes SET blob_hash = ?, size = ?, mtime = ? WHERE id = ?").run(actual, info.size, Date.now(), node.id)
+      tx(() => {
+        if (node.blob_hash) {
+          db.prepare("INSERT INTO versions (id, node_id, blob_hash, size, created_at) VALUES (?, ?, ?, ?, ?)").run(
+            randomUUID(), node.id, node.blob_hash, node.size ?? 0, Date.now()
+          )
+          db.prepare("UPDATE blobs SET refs = refs - 1 WHERE hash = ?").run(node.blob_hash)
+        }
+        db.prepare("INSERT INTO blobs (hash, size, refs, created_at) VALUES (?, ?, 1, ?) ON CONFLICT(hash) DO UPDATE SET refs = refs + 1").run(actual, info.size, Date.now())
+        db.prepare("UPDATE nodes SET blob_hash = ?, size = ?, mtime = ? WHERE id = ?").run(actual, info.size, Date.now(), node.id)
+      })
       broadcast("files", { replaced: node.id })
       return sendJson(res, 200, { nodeId: node.id, hash: actual, size: info.size, replaced: true })
     }
@@ -969,10 +1026,27 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (method === "GET" && path === "/api/search") {
     const raw = (url.searchParams.get("q") ?? "").trim()
     if (!raw) return sendJson(res, 200, { items: [], query: "" })
-    const like = "%" + raw.replace(/[\\%_]/g, (ch) => "\\" + ch) + "%"
-    const rows = db.prepare(
-      "SELECT id, name, kind, size, parent_id, mtime FROM nodes WHERE deleted = 0 AND id <> ? AND name LIKE ? ESCAPE '\\' ORDER BY mtime DESC LIMIT 100"
-    ).all(INBOX, like) as any[]
+    // Trigram FTS needs at least three characters; shorter queries stay on LIKE.
+    // Either way the row set is small, so both paths share the same shaping code.
+    let rows: any[] = []
+    if (raw.length >= 3) {
+      try {
+        const match = '"' + raw.replace(/"/g, '""') + '"'
+        rows = db.prepare(
+          "SELECT n.id, n.name, n.kind, n.size, n.parent_id, n.mtime FROM nodes_fts f JOIN nodes n ON n.rowid = f.rowid " +
+          "WHERE nodes_fts MATCH ? AND n.deleted = 0 AND n.id <> ? ORDER BY n.mtime DESC LIMIT 100"
+        ).all(match, INBOX) as any[]
+      } catch (err: any) {
+        console.error("[search] fts failed, using LIKE:", err?.message)
+        rows = []
+      }
+    }
+    if (rows.length === 0) {
+      const like = "%" + raw.replace(/[\\%_]/g, (ch) => "\\" + ch) + "%"
+      rows = db.prepare(
+        "SELECT id, name, kind, size, parent_id, mtime FROM nodes WHERE deleted = 0 AND id <> ? AND name LIKE ? ESCAPE '\\' ORDER BY mtime DESC LIMIT 100"
+      ).all(INBOX, like) as any[]
+    }
     const items = rows.map((r) => {
       const path: string[] = []
       let cur = r.parent_id
@@ -1090,7 +1164,7 @@ const server = http.createServer((req, res) => {
 setInterval(async () => {
   for (const res of subs) res.write(": ping\n\n")
   const now = Date.now()
-  await collectGarbage(null)
+    await collectGarbage(null)
   db.prepare("DELETE FROM shares WHERE expires_at IS NOT NULL AND expires_at < ?").run(now)
   db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(now)
   const expired = db.prepare("SELECT id FROM nodes WHERE expires_at IS NOT NULL AND expires_at < ? AND deleted = 0").all(now) as any[]
@@ -1101,6 +1175,17 @@ setInterval(async () => {
   const staleHashes: string[] = []
   for (const row of stale) staleHashes.push(...purgeTree(row.id))
   if (staleHashes.length > 0) await collectGarbage(staleHashes)
+  // Abandoned upload sessions hold a .part file each; drop them after a day.
+  try {
+    const staleUploads = db.prepare("SELECT id, path FROM uploads WHERE created_at < ?").all(now - 24 * 3600 * 1000) as any[]
+    for (const row of staleUploads) {
+      await removeQuiet(row.path)
+      db.prepare("DELETE FROM uploads WHERE id = ?").run(row.id)
+    }
+    if (staleUploads.length > 0) console.log("[reaper] dropped " + staleUploads.length + " stale upload(s)")
+  } catch (err: any) {
+    console.error("[reaper] upload sweep", err?.message)
+  }
 }, 30000).unref()
 
 server.listen(PORT, HOST, () => {

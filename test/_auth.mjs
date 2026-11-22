@@ -8,7 +8,21 @@ export async function authHeaders(base) {
     headers.authorization = "Bearer " + process.env.DS_AUTH
     return headers
   }
+  // One session shared by every suite, so running them in sequence does not trip
+  // the login throttle. Delete the file to force a fresh login.
   let cookie = process.env.DS_COOKIE || ""
+  if (!cookie) {
+    try {
+      const fs = await import("node:fs")
+      const file = new URL("./.session", import.meta.url)
+      const saved = fs.readFileSync(file, "utf8").trim()
+      if (saved && saved.split("=")[1]) {
+        const probe = await fetch(base + "/api/auth/me", { headers: { cookie: saved } })
+        const me = await probe.json()
+        if (me.user) cookie = saved
+      }
+    } catch (err) { /* no cached session yet */ }
+  }
   if (!cookie) {
     const me = await (await fetch(base + "/api/auth/me")).json()
     const path = me.setupRequired ? "/api/auth/setup" : "/api/auth/login"
@@ -22,5 +36,9 @@ export async function authHeaders(base) {
     cookie = set.split(";")[0]
   }
   headers.cookie = cookie
+  try {
+    const fs = await import("node:fs")
+    fs.writeFileSync(new URL("./.session", import.meta.url), cookie)
+  } catch (err) { /* caching the session is best-effort */ }
   return headers
 }

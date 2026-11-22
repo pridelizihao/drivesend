@@ -839,14 +839,25 @@ function setView(view) {
 }
 
 let filesRenderId = 0
-async function loadFiles(parent) {
+let filesOffset = 0
+const FILES_PAGE = 200
+
+async function loadFiles(parent, append) {
   const renderId = ++filesRenderId
+  const offset = append ? filesOffset : 0
   try {
-    const data = await api("api/files" + (parent ? "?parent=" + encodeURIComponent(parent) : ""))
+    const query = []
+    if (parent) query.push("parent=" + encodeURIComponent(parent))
+    query.push("limit=" + FILES_PAGE)
+    if (offset) query.push("offset=" + offset)
+    const data = await api("api/files?" + query.join("&"))
     if (renderId !== filesRenderId) return
+    filesOffset = offset + data.items.length
+    state.total = data.total
+    state.hasMore = data.hasMore
     state.parent = data.parent
     state.breadcrumb = data.breadcrumb
-    state.items = data.items
+    state.items = append ? state.items.concat(data.items) : data.items
     state.selected = null
     state.searching = false
     renderCrumbs()
@@ -941,6 +952,21 @@ function renderFiles() {
       })
     }, "danger"))
     list.append(row)
+  }
+  if (state.hasMore) {
+    const shown = state.items.length
+    const total = state.total || shown
+    list.append(el("div", { class: "list-more" }, [
+      el("span", { class: "hint", text: "已显示 " + shown + " / " + total + " 项" }),
+      el("button", {
+        class: "btn ghost small", text: "加载更多",
+        onclick: (event) => {
+          event.target.disabled = true
+          event.target.textContent = "加载中…"
+          loadFiles(state.parent, true)
+        },
+      }),
+    ]))
   }
 }
 
