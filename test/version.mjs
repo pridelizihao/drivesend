@@ -54,7 +54,7 @@ check("size updated in listing", row && row.size === v2.length, row)
 
 const view = await fetch(BASE + "/view/" + nodeId, { headers: AUTH })
 const html = await view.text()
-check("viewer page serves", view.status === 200 && html.includes("上传新版本"), view.status)
+check("viewer page serves", view.status === 200 && html.includes("替换为新版本"), view.status)
 check("viewer embeds inline pdf/doc", html.includes("?inline=1"), html.includes("?inline=1"))
 
 const missing = await j("/api/upload/init", { method: "POST", body: JSON.stringify({ name: "x.txt", size: 10, replaceNodeId: "00000000-0000-0000-0000-000000000000" }) })

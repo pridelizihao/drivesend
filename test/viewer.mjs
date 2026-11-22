@@ -18,7 +18,9 @@ const page = await (await fetch(BASE + "/view/" + id, { headers: AUTH })).text()
 const checks = {
   "picker is a button": page.includes('id="uploadBtn"'),
   "input not using hidden attr": !/id="file"[^>]* hidden/.test(page),
-  "click handler wired": page.includes("document.getElementById('file').click()"),
+  "click handler wired": page.includes("fileInput.click()"),
+  "drag-drop replace": page.includes("dataTransfer") && page.includes("replaceWith(f)"),
+  "drop overlay": page.includes("松开即可用这个文件替换当前版本"),
   "progress label present": page.includes("上传中 "),
   "reloads after replace": page.includes("?inline=1&t="),
 }
