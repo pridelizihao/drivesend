@@ -20,6 +20,7 @@ const checks = {
   "input not using hidden attr": !/id="file"[^>]* hidden/.test(page),
   "click handler wired": page.includes("fileInput.click()"),
   "drag-drop replace": page.includes("dataTransfer") && page.includes("replaceWith(f)"),
+  "paste to replace": page.includes("'paste'") && page.includes("clipboardData"),
   "drop overlay": page.includes("松开即可用这个文件替换当前版本"),
   "progress label present": page.includes("上传中 "),
   "reloads after replace": page.includes("?inline=1&t="),
