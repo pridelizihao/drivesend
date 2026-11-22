@@ -128,6 +128,27 @@ async function copyText(text) {
   }
 }
 
+// Thumbnails are the original file scaled down by the browser, so keep them lazy
+// and skip anything large: without a server-side decoder there is nothing to shrink.
+const THUMB_MAX_BYTES = 8 * 1024 * 1024
+
+function fileGlyph(item) {
+  if (previewKind(item.name) === "image" && item.size <= THUMB_MAX_BYTES) {
+    const img = document.createElement("img")
+    img.className = "thumb"
+    img.src = "api/download/" + item.id + "?inline=1"
+    img.loading = "lazy"
+    img.decoding = "async"
+    img.alt = ""
+    img.addEventListener("error", () => {
+      const fallback = el("div", { class: "icon", text: icon(item.name, item.kind) })
+      img.replaceWith(fallback)
+    })
+    return img
+  }
+  return el("div", { class: "icon", text: icon(item.name, item.kind) })
+}
+
 function toast(text, isError) {
   const node = el("div", { class: "toast" + (isError ? " err" : ""), text })
   $("#toasts").append(node)
@@ -634,7 +655,7 @@ async function loadSearch(query) {
   for (const item of data.items) {
     const isFolder = item.kind === "folder"
     const row = el("div", { class: "row" }, [
-      el("div", { class: "icon", text: icon(item.name, item.kind) }),
+      fileGlyph(item),
       el("div", {
         class: "name" + (isFolder ? " folder" : ""),
         text: item.name,
@@ -714,7 +735,7 @@ function renderFiles() {
     const isFolder = item.kind === "folder"
     const row = el("div", { class: "row", "data-id": item.id }, [
       makeCheckbox(item),
-      el("div", { class: "icon", text: icon(item.name, item.kind) }),
+      fileGlyph(item),
       el("div", {
         class: "name" + (isFolder ? " folder" : ""),
         text: item.name,

@@ -335,7 +335,7 @@ button { font: inherit; color: inherit; }
 
 .row {
   display: grid;
-  grid-template-columns: 20px 30px minmax(0, 1fr) 104px 142px 152px;
+  grid-template-columns: 20px 32px minmax(0, 1fr) 104px 142px 152px;
   align-items: center;
   gap: 10px;
   padding: 11px 16px;
@@ -347,6 +347,16 @@ button { font: inherit; color: inherit; }
 .row.is-selected { background: rgba(0, 113, 227, 0.08); }
 
 .row .icon { font-size: 17px; line-height: 1; text-align: center; }
+
+.thumb {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  object-fit: cover;
+  display: block;
+  background: rgba(0, 0, 0, 0.05);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.06);
+}
 .row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: -0.005em; }
 .row .name.folder { cursor: pointer; font-weight: 500; }
 .row .name.folder:hover { color: var(--blue); }
