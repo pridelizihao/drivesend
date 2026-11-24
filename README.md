@@ -232,7 +232,10 @@ location /drive/ {
 ```
 
 `proxy_pass` 结尾的斜杠会剥掉 `/drive` 前缀；服务端的 `BASE_PATH` 负责生成正确的绝对链接与 Cookie 路径。
-两者必须成对配置，否则登录跳转会指向错误位置。
+
+服务端也会在收到带前缀的路径时自行剥离，所以即使代理没有去掉前缀也能工作。
+改了任何页面渲染代码后，务必跑一次 `test/subpath.mjs`——子路径下写死的 `/s/...` 会跑到站点根目录，
+落到那一层别的站点上，而不是报错。
 
 ## 安全模型
 
@@ -279,6 +282,7 @@ node test/version.mjs    # 版本替换与阅读页（11 项断言）
 node test/share.mjs      # 分享链接去重（4 项断言）
 node test/paging.mjs     # 分页、全文检索、上传持久化、事务（17 项断言）
 node test/sharepage.mjs  # 分享页预览、文件夹浏览、zip、越权访问（23 项断言）
+node test/subpath.mjs    # 子路径部署：所有内部链接必须带 BASE_PATH 前缀（11 项断言）
 node test/sha256.mjs     # 纯 JS SHA-256 与原生实现比对
 ```
 

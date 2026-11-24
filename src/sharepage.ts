@@ -27,7 +27,6 @@ const CSS = [
   ".hint{color:#86868b;font-size:12px}",
   ".btn{display:inline-flex;align-items:center;gap:7px;padding:11px 22px;border-radius:980px;background:linear-gradient(180deg,#0a84ff,#0071e3);color:#fff;text-decoration:none;font-weight:600;font-size:14px;box-shadow:0 1px 2px rgba(0,0,0,.12),inset 0 1px 0 rgba(255,255,255,.24)}",
   ".btn:hover{filter:brightness(1.06)}",
-  ".btn.ghost{background:rgba(255,255,255,.92);color:#1d1d1f;font-weight:500;border:1px solid rgba(0,0,0,.06);box-shadow:0 1px 2px rgba(0,0,0,.05)}",
   ".preview{padding:16px;background:rgba(0,0,0,.03);display:grid;place-items:center;min-height:180px}",
   ".preview img{max-width:100%;max-height:74vh;border-radius:12px;display:block}",
   ".preview video{max-width:100%;max-height:74vh;border-radius:12px;display:block;background:#000}",
@@ -45,9 +44,18 @@ const CSS = [
 export type ShareNode = { id: string; name: string; kind: string; size: number; blob_hash: string | null }
 export type Crumb = { id: string; name: string }
 
+/**
+ * Every link on this page must carry the deployment prefix. When the app is
+ * mounted under BASE_PATH (e.g. /drive) an absolute "/s/..." would escape to the
+ * web root and land on whatever other site lives there.
+ */
+function shareUrl(base: string, token: string, suffix = ""): string {
+  return base + "/s/" + token + suffix
+}
+
 export function previewKind(name: string): "image" | "pdf" | "video" | "audio" | "text" | null {
   const ext = (name.split(".").pop() || "").toLowerCase()
-  if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "svg"].includes(ext)) return ext === "svg" ? null : "image"
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif"].includes(ext)) return "image"
   if (ext === "pdf") return "pdf"
   if (["mp4", "webm", "mov", "m4v"].includes(ext)) return "video"
   if (["mp3", "wav", "flac", "m4a", "ogg", "aac"].includes(ext)) return "audio"
@@ -81,13 +89,13 @@ function icon(name: string, kind: string): string {
   return "📄"
 }
 
-function previewHtml(token: string, node: ShareNode): string {
+function previewHtml(base: string, token: string, node: ShareNode): string {
   const kind = previewKind(node.name)
-  const src = "/s/" + token + "/download?p=" + node.id + "&inline=1"
-  if (kind === "image") return "<img src=\"" + src + "\" alt=\"" + esc(node.name) + "\">"
-  if (kind === "pdf") return "<iframe src=\"" + src + "\" title=\"" + esc(node.name) + "\"></iframe>"
-  if (kind === "video") return "<video controls playsinline preload=\"metadata\" src=\"" + src + "\"></video>"
-  if (kind === "audio") return "<audio controls preload=\"metadata\" src=\"" + src + "\"></audio>"
+  const src = shareUrl(base, token, "/download?p=" + node.id + "&inline=1")
+  if (kind === "image") return "<img src=\"" + esc(src) + "\" alt=\"" + esc(node.name) + "\">"
+  if (kind === "pdf") return "<iframe src=\"" + esc(src) + "\" title=\"" + esc(node.name) + "\"></iframe>"
+  if (kind === "video") return "<video controls playsinline preload=\"metadata\" src=\"" + esc(src) + "\"></video>"
+  if (kind === "audio") return "<audio controls preload=\"metadata\" src=\"" + esc(src) + "\"></audio>"
   if (kind === "text") {
     return "<pre id=\"txt\">加载中…</pre><script>fetch(" + JSON.stringify(src) + ").then(r=>r.text()).then(t=>{document.getElementById('txt').textContent=t.slice(0,524288)}).catch(()=>{document.getElementById('txt').textContent='加载失败'})</script>"
   }
@@ -95,6 +103,7 @@ function previewHtml(token: string, node: ShareNode): string {
 }
 
 export function renderSharePage(opts: {
+  base: string
   token: string
   expiresAt: number | null
   node: ShareNode
@@ -102,10 +111,25 @@ export function renderSharePage(opts: {
   children: Array<{ id: string; name: string; kind: string; size: number }>
   totalBytes?: number
 }): string {
-  const { token, expiresAt, node, crumbs, children } = opts
+  const { base, token, expiresAt, node, crumbs, children } = opts
   const exp = expiresAt ? "有效期至 " + new Date(expiresAt).toLocaleString("zh-CN") : "永久有效"
   const isFolder = node.kind === "folder"
-  const downloadHref = "/s/" + token + "/download?p=" + node.id
+  const downloadHref = shareUrl(base, token, "/download?p=" + node.id)
+  const rootHref = shareUrl(base, token)
+
+  const crumbBar = () => {
+    if (crumbs.length === 0) return []
+    const out: string[] = ["<div class=\"crumbs\">", "<a href=\"" + esc(rootHref) + "\">全部文件</a>"]
+    for (const crumb of crumbs) {
+      out.push("<span class=\"sep\">/</span>")
+      out.push(crumb.id === node.id
+        ? "<span class=\"cur\">" + esc(crumb.name) + "</span>"
+        : "<a href=\"" + esc(shareUrl(base, token, "?p=" + crumb.id)) + "\">" + esc(crumb.name) + "</a>")
+    }
+    out.push("</div>")
+    return out
+  }
+
   const parts: string[] = [
     "<!doctype html>",
     "<html lang=\"zh-CN\"><head>",
@@ -123,26 +147,17 @@ export function renderSharePage(opts: {
     "</div>",
   ]
 
+  parts.push(...crumbBar())
+
   if (isFolder) {
-    if (crumbs.length > 0) {
-      parts.push("<div class=\"crumbs\">")
-      parts.push("<a href=\"" + "/s/" + token + "\">全部文件</a>")
-      for (const crumb of crumbs) {
-        parts.push("<span class=\"sep\">/</span>")
-        parts.push(crumb.id === node.id
-          ? "<span class=\"cur\">" + esc(crumb.name) + "</span>"
-          : "<a href=\"" + "/s/" + token + "?p=" + crumb.id + "\">" + esc(crumb.name) + "</a>")
-      }
-      parts.push("</div>")
-    }
     parts.push("<div class=\"list\">")
     if (children.length === 0) {
       parts.push("<div class=\"row\"><span class=\"nm hint\">这个文件夹是空的</span></div>")
     }
     for (const child of children) {
-      const href = "/s/" + token + "?p=" + child.id
+      const href = shareUrl(base, token, "?p=" + child.id)
       parts.push(
-        "<a class=\"row\" href=\"" + href + "\">" +
+        "<a class=\"row\" href=\"" + esc(href) + "\">" +
         "<span class=\"ic\">" + icon(child.name, child.kind) + "</span>" +
         "<span class=\"nm\">" + esc(child.name) + "</span>" +
         "<span class=\"sz\">" + (child.kind === "folder" ? "" : human(child.size)) + "</span>" +
@@ -153,24 +168,13 @@ export function renderSharePage(opts: {
     parts.push("</div>")
     parts.push("<div class=\"foot\">")
     parts.push("<span class=\"hint\">文件夹会打包成 zip 下载</span>")
-    parts.push("<a class=\"btn\" href=\"" + downloadHref + "\">打包下载</a>")
+    parts.push("<a class=\"btn\" href=\"" + esc(downloadHref) + "\">打包下载</a>")
     parts.push("</div>")
   } else {
-    if (crumbs.length > 0) {
-      parts.push("<div class=\"crumbs\">")
-      parts.push("<a href=\"" + "/s/" + token + "\">全部文件</a>")
-      for (const crumb of crumbs) {
-        parts.push("<span class=\"sep\">/</span>")
-        parts.push(crumb.id === node.id
-          ? "<span class=\"cur\">" + esc(crumb.name) + "</span>"
-          : "<a href=\"" + "/s/" + token + "?p=" + crumb.id + "\">" + esc(crumb.name) + "</a>")
-      }
-      parts.push("</div>")
-    }
-    parts.push("<div class=\"preview\">" + previewHtml(token, node) + "</div>")
+    parts.push("<div class=\"preview\">" + previewHtml(base, token, node) + "</div>")
     parts.push("<div class=\"foot\">")
     parts.push("<span class=\"hint\">" + human(node.size) + "</span>")
-    parts.push("<a class=\"btn\" href=\"" + downloadHref + "\">下载</a>")
+    parts.push("<a class=\"btn\" href=\"" + esc(downloadHref) + "\">下载</a>")
     parts.push("</div>")
   }
 
@@ -178,7 +182,7 @@ export function renderSharePage(opts: {
   return parts.join("\n")
 }
 
-export function renderShareError(code: number, message: string): string {
+export function renderShareError(message: string): string {
   return [
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">",
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",

@@ -28,7 +28,7 @@ const token = share.data.token
 const page = await fetch(BASE + "/s/" + token)
 const html = await page.text()
 check("share page renders", page.status === 200, page.status)
-check("image preview embedded", html.includes("/download?p=" + imgId + "&inline=1") && html.includes("<img"), html.slice(0, 120))
+check("image preview embedded", html.includes("p=" + imgId) && html.includes("inline=1") && html.includes("<img"), html.slice(0, 120))
 check("download button present", html.includes("/download?p=" + imgId), "missing")
 check("expiry shown", html.includes("有效期至"), "missing")
 

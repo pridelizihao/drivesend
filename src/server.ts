@@ -6,7 +6,7 @@ import { extname, join, resolve } from "node:path"
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto"
 import { openDb } from "./db.ts"
 import { MIME, blobPath, ensureParent, fileExists, hashFile, removeQuiet } from "./storage.ts"
-import { renderSharePage, renderShareError, previewKind as sharePreviewKind } from "./sharepage.ts"
+import { renderSharePage, renderShareError } from "./sharepage.ts"
 import { streamZip } from "./zip.ts"
 import type { ZipEntry } from "./zip.ts"
 
@@ -646,7 +646,12 @@ function authed(req: IncomingMessage, url: URL): boolean {
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", "http://localhost")
-  const path = url.pathname
+  let path = url.pathname
+  // A reverse proxy normally strips BASE_PATH before forwarding. Doing it here too
+  // means the app also works when the proxy forwards the prefix untouched.
+  if (BASE && (path === BASE || path.startsWith(BASE + "/"))) {
+    path = path.slice(BASE.length) || "/"
+  }
   const method = req.method ?? "GET"
 
   if (method === "POST" && path === "/api/auth/setup") {
@@ -1152,20 +1157,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const pubMatch = /^\/s\/([A-Za-z0-9_-]+)(\/download)?$/.exec(path)
   if (pubMatch && method === "GET") {
     const row = db.prepare("SELECT s.token, s.expires_at, s.node_id, n.name, n.kind, n.size, n.blob_hash FROM shares s JOIN nodes n ON n.id = s.node_id WHERE s.token = ? AND n.deleted = 0").get(pubMatch[1]) as any
-    if (!row) {
-      res.writeHead(404, { "content-type": "text/html; charset=utf-8" })
-      res.end("<!doctype html><meta charset=utf-8><body style=\"background:#f5f5f7;color:#6e6e73;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;display:grid;place-items:center;height:100vh;margin:0\">链接不存在或已被删除</body>")
-      return
-    }
-    if (row.expires_at !== null && row.expires_at < Date.now()) {
-      res.writeHead(410, { "content-type": "text/html; charset=utf-8" })
-      res.end("<!doctype html><meta charset=utf-8><body style=\"background:#f5f5f7;color:#6e6e73;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;display:grid;place-items:center;height:100vh;margin:0\">链接已过期</body>")
+    if (!row || (row.expires_at !== null && row.expires_at < Date.now())) {
+      const html = renderShareError(row ? "链接已过期" : "链接不存在或已被删除")
+      res.writeHead(row ? 410 : 404, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(html) })
+      res.end(html)
       return
     }
     const requested = url.searchParams.get("p")
     const node = resolveShareNode(row.node_id, requested)
     if (!node) {
-      const html = renderShareError(404, "内容不存在")
+      const html = renderShareError("内容不存在")
       res.writeHead(404, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(html) })
       res.end(html)
       return
@@ -1201,6 +1202,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       : []
     const totalBytes = children.reduce((sum: number, child: any) => sum + (child.size || 0), 0)
     const html = renderSharePage({
+      base: BASE,
       token: row.token,
       expiresAt: row.expires_at,
       node: { id: node.id, name: node.name, kind: node.kind, size: node.size, blob_hash: node.blob_hash },
