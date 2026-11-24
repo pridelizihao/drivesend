@@ -407,7 +407,7 @@ button { font: inherit; color: inherit; }
 .row .name.folder { cursor: pointer; font-weight: 500; }
 .row .name.folder:hover { color: var(--blue); }
 .row .size, .row .time { color: var(--ink-3); font-size: 12px; }
-.row .ops { display: flex; gap: 4px; justify-content: flex-end; flex-wrap: nowrap; }
+.row .ops { display: flex; gap: 2px; justify-content: flex-end; flex-wrap: nowrap; }
 
 .empty { padding: 56px 20px; text-align: center; color: var(--ink-3); font-size: 13px; }
 

@@ -1,11 +1,14 @@
 import http from "node:http"
 import type { IncomingMessage, ServerResponse } from "node:http"
-import { createReadStream, readdirSync } from "node:fs"
+import { createReadStream, existsSync } from "node:fs"
 import { mkdir, open as openFd, readFile, rename, stat, writeFile } from "node:fs/promises"
 import { extname, join, resolve } from "node:path"
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto"
 import { openDb } from "./db.ts"
 import { MIME, blobPath, ensureParent, fileExists, hashFile, removeQuiet } from "./storage.ts"
+import { renderSharePage, renderShareError, previewKind as sharePreviewKind } from "./sharepage.ts"
+import { streamZip } from "./zip.ts"
+import type { ZipEntry } from "./zip.ts"
 
 const ROOT = resolve(import.meta.dirname, "..")
 const WEB = join(ROOT, "web")
@@ -217,6 +220,62 @@ async function collectGarbage(hashes: string[] | null): Promise<void> {
   }
 }
 
+/** A share exposes its root and everything below it, and nothing else. */
+function resolveShareNode(rootId: string, requested: string | null): any | null {
+  const root = db.prepare("SELECT id, name, kind, size, blob_hash FROM nodes WHERE id = ? AND deleted = 0").get(rootId) as any
+  if (!root) return null
+  if (!requested || requested === rootId) return root
+  const node = db.prepare("SELECT id, name, kind, size, blob_hash FROM nodes WHERE id = ? AND deleted = 0").get(requested) as any
+  if (!node) return null
+  let cur = node.id
+  let guard = 0
+  while (cur && guard++ < 200) {
+    const row = db.prepare("SELECT parent_id FROM nodes WHERE id = ?").get(cur) as any
+    if (!row) return null
+    cur = row.parent_id
+    if (cur === rootId) return node
+    if (!cur) return null
+  }
+  return null
+}
+
+function shareCrumbs(rootId: string, nodeId: string): Array<{ id: string; name: string }> {
+  const out: Array<{ id: string; name: string }> = []
+  let cur = nodeId
+  let guard = 0
+  while (cur && guard++ < 200) {
+    const row = db.prepare("SELECT id, parent_id, name FROM nodes WHERE id = ?").get(cur) as any
+    if (!row) break
+    out.unshift({ id: row.id, name: row.name })
+    if (row.id === rootId) break
+    cur = row.parent_id
+  }
+  return out
+}
+
+function collectZipEntries(rootId: string): { entries: ZipEntry[]; total: number } {
+  const entries: ZipEntry[] = []
+  let total = 0
+  let count = 0
+  const walk = (id: string, prefix: string) => {
+    const rows = db.prepare("SELECT id, name, kind, size, blob_hash, mtime FROM nodes WHERE parent_id = ? AND deleted = 0 ORDER BY (kind = 'folder') DESC, name COLLATE NOCASE").all(id) as any[]
+    for (const row of rows) {
+      if (count++ > 5000) return
+      const path = prefix ? prefix + "/" + row.name : row.name
+      if (row.kind === "folder") {
+        walk(row.id, path)
+      } else if (row.blob_hash) {
+        const file = blobPath(BLOBS, row.blob_hash)
+        if (!existsSync(file)) continue
+        entries.push({ path, file, size: row.size ?? 0, mtime: row.mtime ?? Date.now() })
+        total += row.size ?? 0
+      }
+    }
+  }
+  walk(rootId, "")
+  return { entries, total }
+}
+
 function subtreeIds(id: string): string[] {
   const out: string[] = []
   const stack: string[] = [id]
@@ -323,34 +382,6 @@ function humanSize(n: number): string {
     i++
   }
   return (i === 0 ? String(v) : v.toFixed(1)) + " " + units[i]
-}
-
-function sharePage(name: string, size: number, token: string, expiresAt: number | null): string {
-  const exp = expiresAt ? new Date(expiresAt).toLocaleString("zh-CN") : "永久有效"
-  const lines = [
-    "<!doctype html>",
-    "<meta charset=\"utf-8\">",
-    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
-    "<title>" + escapeHtml(name) + " · DriveSend</title>",
-    "<style>",
-    "html,body{height:100%}",
-    "body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f5f7;color:#1d1d1f;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','PingFang SC','Microsoft YaHei',sans-serif;-webkit-font-smoothing:antialiased}",
-    "body::before{content:'';position:fixed;inset:-25vmax;z-index:-1;background:radial-gradient(38vmax 38vmax at 10% 8%,rgba(122,178,255,.55),transparent 62%),radial-gradient(32vmax 32vmax at 88% 2%,rgba(255,176,212,.5),transparent 60%),radial-gradient(40vmax 40vmax at 78% 88%,rgba(150,226,208,.5),transparent 62%);filter:blur(40px) saturate(120%)}",
-    ".card{width:min(520px,90vw);background:rgba(255,255,255,.72);-webkit-backdrop-filter:saturate(180%) blur(22px);backdrop-filter:saturate(180%) blur(22px);border:1px solid rgba(255,255,255,.9);border-radius:22px;padding:30px;box-shadow:0 18px 50px rgba(0,0,0,.1),0 1px 2px rgba(0,0,0,.04)}",
-    ".kicker{color:#86868b;font-size:11px;letter-spacing:.14em;text-transform:uppercase}",
-    "h1{font-size:21px;margin:10px 0 6px;word-break:break-all;letter-spacing:-.015em}",
-    ".meta{color:#6e6e73;font-size:13px;margin-bottom:22px}",
-    "a.btn{display:block;text-align:center;padding:13px;border-radius:980px;background:linear-gradient(180deg,#0a84ff,#0071e3);color:#fff;text-decoration:none;font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.12),inset 0 1px 0 rgba(255,255,255,.24)}",
-    "a.btn:hover{filter:brightness(1.06)}",
-    "</style>",
-    "<div class=\"card\">",
-    "<div class=\"kicker\">DriveSend 分享</div>",
-    "<h1>" + escapeHtml(name) + "</h1>",
-    "<div class=\"meta\">" + humanSize(size) + " · " + exp + "</div>",
-    "<a class=\"btn\" href=\"" + BASE + "/s/" + token + "/download\">下载</a>",
-    "</div>",
-  ]
-  return lines.join("\n")
 }
 
 async function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<void> {
@@ -1091,7 +1122,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const body = await readJson(req)
     const node = db.prepare("SELECT id, kind FROM nodes WHERE id = ? AND deleted = 0").get(body.nodeId) as any
     if (!node) return fail(res, 404, "not found")
-    if (node.kind !== "file") return fail(res, 400, "only files can be shared for now")
+    if (node.id === INBOX) return fail(res, 400, "传输站不能分享")
     const hours = Number(body.ttlHours ?? 0)
     const expiresAt = hours > 0 ? Date.now() + hours * 3600 * 1000 : null
     // Reuse an existing link for the same file and the same lifetime instead of
@@ -1106,9 +1137,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   if (method === "GET" && path === "/api/shares") {
-    const rows = db.prepare("SELECT s.token, s.expires_at, s.created_at, s.downloads, n.name, n.size FROM shares s JOIN nodes n ON n.id = s.node_id WHERE n.deleted = 0 ORDER BY s.created_at DESC LIMIT 100").all() as any[]
+    const rows = db.prepare("SELECT s.token, s.expires_at, s.created_at, s.downloads, n.name, n.kind, n.size FROM shares s JOIN nodes n ON n.id = s.node_id WHERE n.deleted = 0 ORDER BY s.created_at DESC LIMIT 100").all() as any[]
     return sendJson(res, 200, {
-      items: rows.map((r) => ({ token: r.token, name: r.name, size: r.size, expiresAt: r.expires_at, createdAt: r.created_at, downloads: r.downloads, url: BASE + "/s/" + r.token, expired: r.expires_at !== null && r.expires_at < Date.now() })),
+      items: rows.map((r) => ({ token: r.token, name: r.name, kind: r.kind, size: r.size, expiresAt: r.expires_at, createdAt: r.created_at, downloads: r.downloads, url: BASE + "/s/" + r.token, expired: r.expires_at !== null && r.expires_at < Date.now() })),
     })
   }
 
@@ -1120,7 +1151,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
   const pubMatch = /^\/s\/([A-Za-z0-9_-]+)(\/download)?$/.exec(path)
   if (pubMatch && method === "GET") {
-    const row = db.prepare("SELECT s.token, s.expires_at, s.node_id, n.name, n.size, n.blob_hash FROM shares s JOIN nodes n ON n.id = s.node_id WHERE s.token = ? AND n.deleted = 0").get(pubMatch[1]) as any
+    const row = db.prepare("SELECT s.token, s.expires_at, s.node_id, n.name, n.kind, n.size, n.blob_hash FROM shares s JOIN nodes n ON n.id = s.node_id WHERE s.token = ? AND n.deleted = 0").get(pubMatch[1]) as any
     if (!row) {
       res.writeHead(404, { "content-type": "text/html; charset=utf-8" })
       res.end("<!doctype html><meta charset=utf-8><body style=\"background:#f5f5f7;color:#6e6e73;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;display:grid;place-items:center;height:100vh;margin:0\">链接不存在或已被删除</body>")
@@ -1131,13 +1162,52 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       res.end("<!doctype html><meta charset=utf-8><body style=\"background:#f5f5f7;color:#6e6e73;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;display:grid;place-items:center;height:100vh;margin:0\">链接已过期</body>")
       return
     }
+    const requested = url.searchParams.get("p")
+    const node = resolveShareNode(row.node_id, requested)
+    if (!node) {
+      const html = renderShareError(404, "内容不存在")
+      res.writeHead(404, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(html) })
+      res.end(html)
+      return
+    }
+
     if (pubMatch[2]) {
       db.prepare("UPDATE shares SET downloads = downloads + 1 WHERE token = ?").run(row.token)
-      const file = blobPath(BLOBS, row.blob_hash)
-      if (!(await fileExists(file))) return fail(res, 410, "blob missing")
-      return streamFile(req, res, file, row.name)
+      if (node.kind === "file") {
+        if (!node.blob_hash) return fail(res, 404, "not found")
+        const file = blobPath(BLOBS, node.blob_hash)
+        if (!(await fileExists(file))) return fail(res, 410, "blob missing")
+        const inline = url.searchParams.get("inline") === "1"
+        return streamFile(req, res, file, node.name, inline, node.blob_hash)
+      }
+      const { entries, total } = collectZipEntries(node.id)
+      if (entries.length === 0) return fail(res, 404, "空文件夹")
+      const size = entries.reduce((sum, entry) => sum + entry.size, 0)
+      console.log("[zip]", node.name, entries.length + " entries", Math.round(size / 1024) + "KB")
+      res.writeHead(200, {
+        "content-type": "application/zip",
+        "content-disposition": contentDisposition(node.name + ".zip"),
+        "cache-control": "no-store",
+        "x-entry-count": String(entries.length),
+        "x-total-bytes": String(total),
+      })
+      await streamZip(res, entries)
+      return
     }
-    const html = sharePage(row.name, row.size, row.token, row.expires_at)
+
+    const crumbs = shareCrumbs(row.node_id, node.id)
+    const children = node.kind === "folder"
+      ? (db.prepare("SELECT id, name, kind, size FROM nodes WHERE parent_id = ? AND deleted = 0 ORDER BY (kind = 'folder') DESC, name COLLATE NOCASE").all(node.id) as any[])
+      : []
+    const totalBytes = children.reduce((sum: number, child: any) => sum + (child.size || 0), 0)
+    const html = renderSharePage({
+      token: row.token,
+      expiresAt: row.expires_at,
+      node: { id: node.id, name: node.name, kind: node.kind, size: node.size, blob_hash: node.blob_hash },
+      crumbs,
+      children: children.map((c: any) => ({ id: c.id, name: c.name, kind: c.kind, size: c.size })),
+      totalBytes,
+    })
     res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(html) })
     res.end(html)
     return

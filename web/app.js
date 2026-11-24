@@ -905,11 +905,8 @@ function renderFiles() {
     const ops = row.querySelector(".ops")
     if (!isFolder) {
       ops.append(opBtn("download", "下载", () => { window.location.href = "api/download/" + item.id }))
-      ops.append(opBtn("share", "分享链接", () => openShare(item)))
-      if (previewKind(item.name) === "pdf") {
-        ops.append(opBtn("open", "在浏览器中打开", () => { window.open("view/" + item.id, "_blank", "noopener") }))
-      }
     }
+    ops.append(opBtn("share", "分享链接", () => openShare(item)))
     ops.append(opBtn("move", "移动到…", () => openMove(item, state.parent)))
     ops.append(opBtn("rename", "重命名", () => openRename(item)))
 
